@@ -1,0 +1,21 @@
+{
+  "name": "raams-crm-backend",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check:backend": "node --check api/health.js && node --check api/ready.js && node --check api/workspace.js && node --check api/integrations.js && node --check api/communications.js && node --check api/webhooks/whatsapp.js && node --check api/_lib/integration_secrets.js && node --check api/_lib/request_id.js && node --check api/_lib/rate_limit.js && node --check api/_lib/config.js && node --check api/_lib/auth.js && node --check api/_lib/database.js && node --check scripts/migrate.js && node scripts/check-migrations.js && node --test test/backend/auth.test.js test/backend/backend_foundation.test.js test/backend/communications.test.js test/backend/migrations.test.js test/backend/workspace_api.test.js",
+    "test:backend": "node --test test/backend/auth.test.js test/backend/backend_foundation.test.js test/backend/communications.test.js test/backend/migrations.test.js test/backend/workspace_api.test.js",
+    "db:migrate": "node scripts/migrate.js"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.2.1",
+    "jose": "^6.2.17",
+    "nodemailer": "^10.6.0",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "dotenv": "^18.0.10"
+  }
+}

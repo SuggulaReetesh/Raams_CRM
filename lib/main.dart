@@ -4,10 +4,16 @@ import 'package:raams_crm/app_config.dart';
 import 'package:raams_crm/backend/auth_gate.dart';
 import 'package:raams_crm/backend/backend_api_client.dart';
 import 'package:raams_crm/backend/remote_customer_workspace_repository.dart';
+import 'package:raams_crm/backend/workspace_access.dart';
+import 'package:raams_crm/backend/workspace_access_dialog.dart';
+import 'package:raams_crm/backend/workspace_selection_gate.dart';
 import 'package:raams_crm/communication.dart';
 import 'package:raams_crm/customer.dart';
 import 'package:raams_crm/delivery.dart';
 import 'package:raams_crm/finance.dart';
+import 'package:raams_crm/procurement.dart';
+import 'package:raams_crm/site_execution.dart';
+import 'package:raams_crm/workforce.dart';
 import 'package:csv/csv.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -17,6 +23,8 @@ import 'package:url_launcher/url_launcher.dart';
 
 part 'finance_dialogs.dart';
 part 'communication_dialogs.dart';
+part 'project_planning_dialogs.dart';
+part 'procurement_dialogs.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -72,6 +80,21 @@ const _studioPermissionLabels = <String, String>{
   StudioPersona.viewCommunications: 'View client and project conversations',
   StudioPersona.manageCommunications:
       'Compose messages, log interactions, and notify teammates',
+  StudioPersona.viewMaterials: 'View the material catalogue',
+  StudioPersona.manageMaterials: 'Manage materials and specifications',
+  StudioPersona.viewVendors: 'View suppliers and contractors',
+  StudioPersona.manageVendors: 'Manage supplier and contractor records',
+  StudioPersona.approveProcurement: 'Approve requisitions and purchase orders',
+};
+
+String _studioPermissionForRole(String permission) => switch (permission) {
+  'projects.view' => StudioPersona.viewProjects,
+  'projects.manage' => StudioPersona.manageProjects,
+  'finance.view' => StudioPersona.viewFinancials,
+  'finance.manage' => StudioPersona.manageFinancials,
+  'workspace.read' => StudioPersona.viewClients,
+  'workspace.write' => StudioPersona.manageClients,
+  _ => permission,
 };
 
 class AtelierApp extends StatelessWidget {
@@ -127,14 +150,39 @@ class AtelierApp extends StatelessWidget {
               authRedirectUrl: config.authRedirectUri?.toString(),
               authenticatedBuilder: (context, session) {
                 final auth = Supabase.instance.client.auth;
-                return StudioHome(
-                  key: ValueKey(session.user.id),
-                  repository: RemoteCustomerWorkspaceRepository(
-                    baseUri: config.requiredApiBaseUri,
-                    accessTokenProvider: () async =>
-                        auth.currentSession?.accessToken,
-                  ),
+                return WorkspaceSelectionGate(
+                  baseUri: config.requiredApiBaseUri,
+                  accessTokenProvider: () async =>
+                      auth.currentSession?.accessToken,
                   onSignOut: () => auth.signOut(),
+                  organizationBuilder: (organization, onSwitchWorkspace) =>
+                      StudioHome(
+                        key: ValueKey('${session.user.id}:${organization.id}'),
+                        repository: RemoteCustomerWorkspaceRepository(
+                          baseUri: config.requiredApiBaseUri,
+                          workspaceId: organization.id,
+                          accessTokenProvider: () async =>
+                              auth.currentSession?.accessToken,
+                        ),
+                        workspaceAccessClient: WorkspaceAccessClient(
+                          baseUri: config.requiredApiBaseUri,
+                          workspaceId: organization.id,
+                          accessTokenProvider: () async =>
+                              auth.currentSession?.accessToken,
+                        ),
+                        accessPersona: StudioPersona(
+                          id: organization.userId,
+                          name: organization.roleName,
+                          description: 'Organization access role',
+                          permissions: {
+                            ...organization.permissions,
+                            ...organization.projectPermissions,
+                          }.map(_studioPermissionForRole).toList(),
+                        ),
+                        organizationPermissions: organization.permissions,
+                        onSignOut: () => auth.signOut(),
+                        onSwitchWorkspace: onSwitchWorkspace,
+                      ),
                 );
               },
             ),
@@ -256,12 +304,20 @@ class _BackendEnvironmentNoticeState extends State<BackendEnvironmentNotice> {
 class StudioHome extends StatefulWidget {
   const StudioHome({
     this.repository = const SharedPreferencesCustomerWorkspaceRepository(),
+    this.workspaceAccessClient,
+    this.accessPersona,
+    this.organizationPermissions,
     this.onSignOut,
+    this.onSwitchWorkspace,
     super.key,
   });
 
   final CustomerWorkspaceRepository repository;
+  final WorkspaceAccessClient? workspaceAccessClient;
+  final StudioPersona? accessPersona;
+  final List<String>? organizationPermissions;
   final Future<void> Function()? onSignOut;
+  final VoidCallback? onSwitchWorkspace;
 
   @override
   State<StudioHome> createState() => _StudioHomeState();
@@ -333,6 +389,10 @@ class _StudioHomeState extends State<StudioHome> {
   List<StudioPersona> _personas = StudioPersona.defaults();
   StudioDeliveryWorkspace _delivery = const StudioDeliveryWorkspace();
   StudioFinancialWorkspace _financials = StudioFinancialWorkspace.defaults();
+  List<StudioLineItemCatalogEntry> _lineItemCatalog = const [];
+  bool _lineItemCatalogLoaded = false;
+  bool _lineItemCatalogLoading = false;
+  String? _lineItemCatalogError;
   List<StudioCommunication> _communications = [];
   String? _communicationClientFilter;
   String? _communicationProjectFilter;
@@ -346,6 +406,8 @@ class _StudioHomeState extends State<StudioHome> {
   bool _savingCustomers = false;
   String? _customerStorageError;
   String? _selectedProjectId;
+  String _projectTab = 'Projects';
+  String _proposalTab = 'Quotations';
   String _taskFilter = 'All';
   String _documentQuery = '';
 
@@ -400,12 +462,16 @@ class _StudioHomeState extends State<StudioHome> {
       )
       .toList();
 
-  StudioPersona get _activePersona => _personas.firstWhere(
-    (persona) => persona.id == _workspacePreferences.activePersonaId,
-    orElse: () => StudioPersona.defaults().first,
-  );
+  StudioPersona get _activePersona =>
+      widget.accessPersona ??
+      _personas.firstWhere(
+        (persona) => persona.id == _workspacePreferences.activePersonaId,
+        orElse: () => StudioPersona.defaults().first,
+      );
 
-  bool _can(String permission) => _activePersona.allows(permission);
+  bool _can(String permission) =>
+      _activePersona.permissions.contains('*') ||
+      _activePersona.allows(permission);
 
   List<StudioTaskRecord> get _filteredTasks {
     final query = _query.toLowerCase();
@@ -470,6 +536,7 @@ class _StudioHomeState extends State<StudioHome> {
     if (repository is RemoteCustomerWorkspaceRepository) {
       repository.close();
     }
+    widget.workspaceAccessClient?.close();
     super.dispose();
   }
 
@@ -523,8 +590,42 @@ class _StudioHomeState extends State<StudioHome> {
               financials: localWorkspace.financials,
               communications: localWorkspace.communications,
             );
+            final importPersona =
+                widget.accessPersona ??
+                localWorkspace.personas.firstWhere(
+                  (item) =>
+                      item.id == localWorkspace.preferences.activePersonaId,
+                  orElse: () => StudioPersona.defaults().first,
+                );
+            if (importPersona.permissions.contains('*') ||
+                importPersona.allows(StudioPersona.manageFinancials)) {
+              for (final entry in await localRepository.loadLineItemCatalog()) {
+                await remoteRepository.saveLineItemCatalogEntry(entry);
+              }
+            }
             workspace = localWorkspace;
           }
+        }
+      }
+      var lineItemCatalog = const <StudioLineItemCatalogEntry>[];
+      var lineItemCatalogLoaded = false;
+      String? lineItemCatalogError;
+      final persona =
+          widget.accessPersona ??
+          workspace.personas.firstWhere(
+            (item) => item.id == workspace.preferences.activePersonaId,
+            orElse: () => StudioPersona.defaults().first,
+          );
+      final canViewFinancials =
+          persona.permissions.contains('*') ||
+          persona.allows(StudioPersona.viewFinancials);
+      if (canViewFinancials) {
+        try {
+          lineItemCatalog = await _customerRepository.loadLineItemCatalog();
+          lineItemCatalogLoaded = true;
+        } on Exception catch (error) {
+          lineItemCatalogError =
+              'Could not load the workspace line-item catalog: $error';
         }
       }
       if (!mounted) return;
@@ -536,6 +637,10 @@ class _StudioHomeState extends State<StudioHome> {
         _workspacePreferences = workspace.preferences;
         _delivery = workspace.delivery;
         _financials = workspace.financials;
+        _lineItemCatalog = lineItemCatalog;
+        _lineItemCatalogLoaded = lineItemCatalogLoaded;
+        _lineItemCatalogError = lineItemCatalogError;
+        _lineItemCatalogLoading = false;
         _communications = workspace.communications;
         _customersLoading = false;
       });
@@ -545,6 +650,71 @@ class _StudioHomeState extends State<StudioHome> {
         _customersLoading = false;
         _customerStorageError = 'Could not load saved clients: $error';
       });
+    }
+  }
+
+  Future<bool> _loadLineItemCatalog({bool announce = true}) async {
+    if (!_can(StudioPersona.viewFinancials)) return false;
+    if (_lineItemCatalogLoaded) return true;
+    if (_lineItemCatalogLoading) return false;
+    setState(() {
+      _lineItemCatalogLoading = true;
+      _lineItemCatalogError = null;
+    });
+    try {
+      final catalog = await _customerRepository.loadLineItemCatalog();
+      if (!mounted) return false;
+      setState(() {
+        _lineItemCatalog = catalog;
+        _lineItemCatalogLoaded = true;
+        _lineItemCatalogLoading = false;
+        _lineItemCatalogError = null;
+      });
+      return true;
+    } on Exception catch (error) {
+      if (!mounted) return false;
+      final message = 'Could not load the workspace line-item catalog: $error';
+      setState(() {
+        _lineItemCatalogLoading = false;
+        _lineItemCatalogError = message;
+      });
+      if (announce) _toast(message);
+      return false;
+    }
+  }
+
+  Future<bool> _saveLineItemCatalogEntry(
+    StudioLineItemCatalogEntry entry,
+  ) async {
+    if (!_can(StudioPersona.manageFinancials)) {
+      _toast('This studio role cannot manage the line-item catalog.');
+      return false;
+    }
+    setState(() {
+      _lineItemCatalogLoading = true;
+      _lineItemCatalogError = null;
+    });
+    try {
+      await _customerRepository.saveLineItemCatalogEntry(entry);
+      final catalog = await _customerRepository.loadLineItemCatalog();
+      if (!mounted) return false;
+      setState(() {
+        _lineItemCatalog = catalog;
+        _lineItemCatalogLoaded = true;
+        _lineItemCatalogLoading = false;
+        _lineItemCatalogError = null;
+      });
+      _toast('${entry.name} saved to the workspace catalog.');
+      return true;
+    } on Exception catch (error) {
+      if (!mounted) return false;
+      final message = 'Could not save ${entry.name}: $error';
+      setState(() {
+        _lineItemCatalogLoading = false;
+        _lineItemCatalogError = message;
+      });
+      _toast(message);
+      return false;
     }
   }
 
@@ -810,7 +980,48 @@ class _StudioHomeState extends State<StudioHome> {
     }
   }
 
+  Future<void> _openOrganizationAccess() async {
+    if (_customersLoading || _savingCustomers) {
+      _toast('Workspace data is still loading or saving. Please try again.');
+      return;
+    }
+    final client = widget.workspaceAccessClient;
+    if (client == null) {
+      await _configurePersonas();
+      return;
+    }
+    final accessPermissions =
+        widget.organizationPermissions ??
+        widget.accessPersona?.permissions ??
+        const <String>[];
+    final canViewAccess = accessPermissions.any(
+      (permission) => {
+        '*',
+        'members.view',
+        'members.manage',
+        'roles.view',
+        'roles.manage',
+      }.contains(permission),
+    );
+    if (!canViewAccess) {
+      _toast('Your organization role cannot view access settings.');
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (context) => WorkspaceAccessDialog(
+        client: client,
+        projects: _delivery.projects,
+        permissions: accessPermissions,
+      ),
+    );
+  }
+
   Future<void> _configurePersonas() async {
+    if (widget.accessPersona != null) {
+      _toast('Production access is managed through organization roles.');
+      return;
+    }
     if (_customersLoading || _savingCustomers) {
       _toast('Workspace data is still loading or saving. Please try again.');
       return;
@@ -982,6 +1193,26 @@ class _StudioHomeState extends State<StudioHome> {
         [...customers, ..._customers],
         confirmation:
             '${customers.length} client${customers.length == 1 ? '' : 's'} imported.',
+        delivery: _delivery.copyWith(
+          importRecords: [
+            ..._delivery.importRecords,
+            StudioImportRecord(
+              id: 'import-${DateTime.now().microsecondsSinceEpoch}',
+              kind: 'Client CSV',
+              fileName: file.name,
+              status: 'Completed',
+              importedCount: customers.length,
+              failedCount: preview.entries
+                  .where((entry) => entry.issue != null)
+                  .length,
+              errors: preview.entries
+                  .where((entry) => entry.issue != null)
+                  .map((entry) => entry.issue!)
+                  .toList(),
+              createdAt: DateTime.now().toUtc(),
+            ),
+          ],
+        ),
         activity: _activity(
           kind: 'csv_import',
           title: 'Clients imported from CSV',
@@ -1181,6 +1412,10 @@ class _StudioHomeState extends State<StudioHome> {
     String channel = 'Internal note',
     String? clientId,
     String? projectId,
+    String? vendorId,
+    String? procurementRecordType,
+    String? procurementRecordId,
+    String? initialRecipient,
   }) async {
     if (_customersLoading || _savingCustomers) {
       _toast('Workspace data is still loading or saving. Please try again.');
@@ -1190,6 +1425,12 @@ class _StudioHomeState extends State<StudioHome> {
       _toast('This studio role cannot add to communication history.');
       return;
     }
+    initialRecipient ??= vendorId == null
+        ? null
+        : _delivery.vendors
+              .where((vendor) => vendor.id == vendorId)
+              .firstOrNull
+              ?.email;
     final draft = await showDialog<CommunicationDraft>(
       context: context,
       builder: (context) => CommunicationComposerDialog(
@@ -1200,11 +1441,14 @@ class _StudioHomeState extends State<StudioHome> {
         initialChannel: channel,
         initialClientId: clientId,
         initialProjectId: projectId,
+        initialRecipient: initialRecipient,
       ),
     );
     if (draft == null || !mounted) return;
     final client = draft.clientId == null ? null : _customerFor(draft.clientId);
-    final project = draft.projectId == null
+    final project = projectId != null
+        ? _projectFor(projectId)
+        : draft.projectId == null
         ? null
         : _projectFor(draft.projectId!);
     final now = DateTime.now();
@@ -1212,6 +1456,9 @@ class _StudioHomeState extends State<StudioHome> {
       id: _newId('communication'),
       clientId: client?.id,
       clientName: client?.name ?? '',
+      vendorId: vendorId,
+      procurementRecordType: procurementRecordType,
+      procurementRecordId: procurementRecordId,
       projectId: project?.id,
       projectName: project?.name ?? '',
       channel: draft.channel,
@@ -1429,6 +1676,26 @@ class _StudioHomeState extends State<StudioHome> {
       );
     } on Exception catch (error) {
       if (mounted) _toast('Could not open the message composer: $error');
+    }
+  }
+
+  Future<void> _callCustomer(Customer customer) async {
+    final phone = customer.phone.trim();
+    if (phone.isEmpty) {
+      _toast('Add a phone number for ${customer.name} before calling.');
+      return;
+    }
+
+    try {
+      final opened = await launchUrl(
+        Uri(scheme: 'tel', path: phone),
+        mode: LaunchMode.externalApplication,
+      );
+      if (!opened && mounted) {
+        _toast('Could not open the phone app for ${customer.name}.');
+      }
+    } on Exception catch (error) {
+      if (mounted) _toast('Could not start a call to ${customer.name}: $error');
     }
   }
 
@@ -2206,6 +2473,10 @@ class _StudioHomeState extends State<StudioHome> {
       context: context,
       builder: (context) => ProjectEditorDialog(
         customers: _customers,
+        canViewBudget:
+            _can(StudioPersona.viewFinancials) ||
+            _can(StudioPersona.manageFinancials),
+        canManageBudget: _can(StudioPersona.manageFinancials),
         project: StudioProject(
           id: _newId('project'),
           name: '',
@@ -2232,8 +2503,14 @@ class _StudioHomeState extends State<StudioHome> {
     }
     final updated = await showDialog<StudioProject>(
       context: context,
-      builder: (context) =>
-          ProjectEditorDialog(customers: _customers, project: project),
+      builder: (context) => ProjectEditorDialog(
+        customers: _customers,
+        canViewBudget:
+            _can(StudioPersona.viewFinancials) ||
+            _can(StudioPersona.manageFinancials),
+        canManageBudget: _can(StudioPersona.manageFinancials),
+        project: project,
+      ),
     );
     if (updated == null || !mounted) return;
     await _saveDelivery(
@@ -2244,6 +2521,158 @@ class _StudioHomeState extends State<StudioHome> {
       ),
       confirmation: '${updated.name} updated.',
       activityTitle: 'Project updated',
+      activityDetails: updated.name,
+    );
+  }
+
+  Future<void> _createProjectPhase(StudioProject project) async {
+    if (!_can(StudioPersona.manageMilestones)) {
+      _toast('This studio role cannot manage project phases.');
+      return;
+    }
+    final phase = await showDialog<StudioProjectPhase>(
+      context: context,
+      builder: (context) => ProjectPhaseEditorDialog(
+        phase: StudioProjectPhase(
+          id: _newId('phase'),
+          projectId: project.id,
+          name: '',
+          position:
+              _delivery.phases
+                  .where((item) => item.projectId == project.id)
+                  .fold<int>(
+                    -1,
+                    (maximum, item) =>
+                        item.position > maximum ? item.position : maximum,
+                  ) +
+              1,
+          status: StudioProjectPhase.statuses.first,
+          startDate: null,
+          endDate: null,
+        ),
+      ),
+    );
+    if (phase == null || !mounted) return;
+    await _saveDelivery(
+      _delivery.copyWith(phases: [..._delivery.phases, phase]),
+      confirmation: 'Project phase added.',
+      activityTitle: 'Project phase added',
+      activityDetails: '${project.name} · ${phase.name}',
+    );
+  }
+
+  Future<void> _editProjectPhase(StudioProjectPhase phase) async {
+    if (!_can(StudioPersona.manageMilestones)) return;
+    final updated = await showDialog<StudioProjectPhase>(
+      context: context,
+      builder: (context) => ProjectPhaseEditorDialog(phase: phase),
+    );
+    if (updated == null || !mounted) return;
+    await _saveDelivery(
+      _delivery.copyWith(
+        phases: _delivery.phases
+            .map((item) => item.id == updated.id ? updated : item)
+            .toList(),
+      ),
+      confirmation: 'Project phase updated.',
+      activityTitle: 'Project phase updated',
+      activityDetails: updated.name,
+    );
+  }
+
+  Future<void> _createMaterial() async {
+    if (!_can(StudioPersona.manageMaterials)) {
+      _toast('This studio role cannot manage materials.');
+      return;
+    }
+    final material = await showDialog<StudioMaterial>(
+      context: context,
+      builder: (context) => MaterialEditorDialog(
+        material: StudioMaterial(
+          id: _newId('material'),
+          name: '',
+          category: StudioMaterial.categories.first,
+          unit: StudioMaterial.units.first,
+          specification: '',
+          description: '',
+          isActive: true,
+        ),
+      ),
+    );
+    if (material == null || !mounted) return;
+    await _saveDelivery(
+      _delivery.copyWith(materials: [..._delivery.materials, material]),
+      confirmation: 'Material added to the catalogue.',
+      activityTitle: 'Material catalogue updated',
+      activityDetails: material.name,
+    );
+  }
+
+  Future<void> _editMaterial(StudioMaterial material) async {
+    if (!_can(StudioPersona.manageMaterials)) return;
+    final updated = await showDialog<StudioMaterial>(
+      context: context,
+      builder: (context) => MaterialEditorDialog(material: material),
+    );
+    if (updated == null || !mounted) return;
+    await _saveDelivery(
+      _delivery.copyWith(
+        materials: _delivery.materials
+            .map((item) => item.id == updated.id ? updated : item)
+            .toList(),
+      ),
+      confirmation: 'Material record updated.',
+      activityTitle: 'Material catalogue updated',
+      activityDetails: updated.name,
+    );
+  }
+
+  Future<void> _createVendor() async {
+    if (!_can(StudioPersona.manageVendors)) {
+      _toast('This studio role cannot manage suppliers or contractors.');
+      return;
+    }
+    final vendor = await showDialog<StudioVendor>(
+      context: context,
+      builder: (context) => VendorEditorDialog(
+        vendor: StudioVendor(
+          id: _newId('vendor'),
+          name: '',
+          kind: StudioVendor.kinds.first,
+          email: '',
+          phone: '',
+          address: '',
+          taxId: '',
+          paymentTerms: '',
+          notes: '',
+          isActive: true,
+        ),
+      ),
+    );
+    if (vendor == null || !mounted) return;
+    await _saveDelivery(
+      _delivery.copyWith(vendors: [..._delivery.vendors, vendor]),
+      confirmation: 'Supplier or contractor added.',
+      activityTitle: 'Vendor directory updated',
+      activityDetails: vendor.name,
+    );
+  }
+
+  Future<void> _editVendor(StudioVendor vendor) async {
+    if (!_can(StudioPersona.manageVendors)) return;
+    final updated = await showDialog<StudioVendor>(
+      context: context,
+      builder: (context) => VendorEditorDialog(vendor: vendor),
+    );
+    if (updated == null || !mounted) return;
+    await _saveDelivery(
+      _delivery.copyWith(
+        vendors: _delivery.vendors
+            .map((item) => item.id == updated.id ? updated : item)
+            .toList(),
+      ),
+      confirmation: 'Vendor record updated.',
+      activityTitle: 'Vendor directory updated',
       activityDetails: updated.name,
     );
   }
@@ -2269,15 +2698,18 @@ class _StudioHomeState extends State<StudioHome> {
       builder: (context) => ProjectTaskEditorDialog(
         projects: _delivery.projects,
         personas: _personas,
+        tasks: _delivery.tasks,
         task: StudioTaskRecord(
           id: _newId('task'),
           projectId: projectId ?? _delivery.projects.first.id,
           title: '',
-          assignee: _activePersona.name,
+          assignee: '',
           dueDate: null,
           isComplete: false,
           priority: 'Normal',
         ),
+        loadProjectAssignees:
+            widget.workspaceAccessClient?.loadProjectAssignees,
       ),
     );
     if (task == null || !mounted) return;
@@ -2299,7 +2731,10 @@ class _StudioHomeState extends State<StudioHome> {
       builder: (context) => ProjectTaskEditorDialog(
         projects: _delivery.projects,
         personas: _personas,
+        tasks: _delivery.tasks,
         task: task,
+        loadProjectAssignees:
+            widget.workspaceAccessClient?.loadProjectAssignees,
       ),
     );
     if (updated == null || !mounted) return;
@@ -2352,6 +2787,9 @@ class _StudioHomeState extends State<StudioHome> {
       context: context,
       builder: (context) => MilestoneEditorDialog(
         projectId: project.id,
+        phases: _delivery.phases
+            .where((phase) => phase.projectId == project.id)
+            .toList(),
         milestone: StudioMilestone(
           id: _newId('milestone'),
           projectId: project.id,
@@ -2378,6 +2816,9 @@ class _StudioHomeState extends State<StudioHome> {
       context: context,
       builder: (context) => MilestoneEditorDialog(
         projectId: milestone.projectId,
+        phases: _delivery.phases
+            .where((phase) => phase.projectId == milestone.projectId)
+            .toList(),
         milestone: milestone,
       ),
     );
@@ -2803,6 +3244,7 @@ class _StudioHomeState extends State<StudioHome> {
       _toast('This studio role cannot create quotations.');
       return;
     }
+    if (!await _loadLineItemCatalog() || !mounted) return;
     final eligibleProjects = _delivery.projects
         .where((project) => _customerFor(project.customerId) != null)
         .toList();
@@ -2819,23 +3261,26 @@ class _StudioHomeState extends State<StudioHome> {
     );
     final project = eligibleProjects.first;
     final client = _customerFor(project.customerId)!;
-    final quotation = await showDialog<StudioQuotation>(
-      context: context,
-      builder: (context) => QuotationEditorDialog(
-        quotation: StudioQuotation(
-          id: _newId('quotation'),
-          number: _documentNumber(settings.quotationPrefix, sequence),
-          projectId: project.id,
-          projectName: project.name,
-          clientId: client.id,
-          clientName: client.name,
-          clientEmail: client.email,
-          title: 'Interior design scope — ${project.name}',
-          items: const [],
-          taxRate: settings.defaultTaxRate,
-          currencySymbol: settings.currencySymbol,
-          createdAt: now,
-          updatedAt: now,
+    final quotation = await Navigator.of(context).push<StudioQuotation>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (context) => QuotationEditorPage(
+          quotation: StudioQuotation(
+            id: _newId('quotation'),
+            number: _documentNumber(settings.quotationPrefix, sequence),
+            projectId: project.id,
+            projectName: project.name,
+            clientId: client.id,
+            clientName: client.name,
+            clientEmail: client.email,
+            title: 'Interior design scope — ${project.name}',
+            items: const [],
+            taxRate: settings.defaultTaxRate,
+            currencySymbol: settings.currencySymbol,
+            createdAt: now,
+            updatedAt: now,
+          ),
+          catalog: _lineItemCatalog,
         ),
       ),
     );
@@ -2856,9 +3301,15 @@ class _StudioHomeState extends State<StudioHome> {
       _toast('This studio role cannot edit quotations.');
       return;
     }
-    final updated = await showDialog<StudioQuotation>(
-      context: context,
-      builder: (context) => QuotationEditorDialog(quotation: quotation),
+    if (!await _loadLineItemCatalog() || !mounted) return;
+    final updated = await Navigator.of(context).push<StudioQuotation>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (context) => QuotationEditorPage(
+          quotation: quotation,
+          catalog: _lineItemCatalog,
+        ),
+      ),
     );
     if (updated == null || !mounted) return;
     await _saveFinancials(
@@ -3302,24 +3753,28 @@ class _StudioHomeState extends State<StudioHome> {
           final selected = _section == index;
           return Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: ListTile(
-              dense: true,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
-              ),
-              selected: selected,
-              selectedTileColor: const Color(0xFFF0EEE8),
-              leading: Icon(item.$2, size: 18, color: selected ? ink : muted),
-              title: Text(
-                item.$1,
-                style: TextStyle(
-                  fontFamily: 'Arial',
-                  fontSize: 12,
-                  color: selected ? ink : const Color(0xFF62645E),
-                  fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+            child: Material(
+              color: Colors.transparent,
+              child: ListTile(
+                dense: true,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
                 ),
+                selected: selected,
+                selectedTileColor: const Color(0xFFF0EEE8),
+                leading:
+                    Icon(item.$2, size: 18, color: selected ? ink : muted),
+                title: Text(
+                  item.$1,
+                  style: TextStyle(
+                    fontFamily: 'Arial',
+                    fontSize: 12,
+                    color: selected ? ink : const Color(0xFF62645E),
+                    fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                  ),
+                ),
+                onTap: () => _navigate(index),
               ),
-              onTap: () => _navigate(index),
             ),
           );
         }),
@@ -3350,8 +3805,10 @@ class _StudioHomeState extends State<StudioHome> {
           ),
         ),
         const Divider(height: 1, color: line),
-        ListTile(
-          leading: CircleAvatar(
+        Material(
+          color: Colors.transparent,
+          child: ListTile(
+            leading: CircleAvatar(
             radius: 16,
             backgroundColor: Color(0xFFE7DED2),
             child: Text(
@@ -3376,7 +3833,9 @@ class _StudioHomeState extends State<StudioHome> {
             ),
           ),
           subtitle: Text(
-            'Previewing ${_activePersona.name}',
+            widget.accessPersona == null
+                ? 'Previewing ${_activePersona.name}'
+                : 'Organization role · ${_activePersona.name}',
             style: TextStyle(fontFamily: 'Arial', fontSize: 10, color: muted),
           ),
           trailing: widget.onSignOut == null
@@ -3385,12 +3844,24 @@ class _StudioHomeState extends State<StudioHome> {
                   tooltip: 'Account options',
                   onSelected: (action) {
                     if (action == 'sign_out') _signOut();
+                    if (action == 'switch_workspace') {
+                      widget.onSwitchWorkspace?.call();
+                    }
                   },
-                  itemBuilder: (context) => const [
-                    PopupMenuItem(value: 'sign_out', child: Text('Sign out')),
+                  itemBuilder: (context) => [
+                    if (widget.onSwitchWorkspace != null)
+                      const PopupMenuItem(
+                        value: 'switch_workspace',
+                        child: Text('Switch organization'),
+                      ),
+                    const PopupMenuItem(
+                      value: 'sign_out',
+                      child: Text('Sign out'),
+                    ),
                   ],
                 ),
-          onTap: _configurePersonas,
+            onTap: _openOrganizationAccess,
+          ),
         ),
       ],
     ),
@@ -3496,8 +3967,10 @@ class _StudioHomeState extends State<StudioHome> {
         ),
         const SizedBox(width: 8),
         IconButton(
-          tooltip: 'Studio roles and preferences',
-          onPressed: _configurePersonas,
+          tooltip: widget.accessPersona == null
+              ? 'Studio roles and preferences'
+              : 'Organization and access',
+          onPressed: _openOrganizationAccess,
           icon: const Icon(Icons.settings_outlined, size: 19, color: ink),
         ),
         const SizedBox(width: 8),
@@ -3908,7 +4381,7 @@ class _StudioHomeState extends State<StudioHome> {
     final project = _projectFor(task.projectId);
     final subtitle = [
       project?.name ?? 'Project removed',
-      task.assignee,
+      task.assignee.isEmpty ? 'Unassigned' : task.assignee,
       'Due ${_dateLabel(task.dueDate)}',
     ].join(' · ');
     return ListTile(
@@ -4415,6 +4888,22 @@ class _StudioHomeState extends State<StudioHome> {
                 size: 16,
               ),
             ),
+          IconButton(
+            tooltip: customer.phone.trim().isEmpty
+                ? 'Phone number unavailable'
+                : 'Call ${customer.name}',
+            onPressed: customer.phone.trim().isEmpty
+                ? null
+                : () => _callCustomer(customer),
+            visualDensity: VisualDensity.compact,
+            constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+            padding: EdgeInsets.zero,
+            icon: const Icon(Icons.call_outlined, size: 18),
+            style: IconButton.styleFrom(
+              foregroundColor: accent,
+              disabledForegroundColor: muted,
+            ),
+          ),
           if (_can(StudioPersona.viewFinancials))
             Text(
               customer.value,
@@ -4432,61 +4921,1236 @@ class _StudioHomeState extends State<StudioHome> {
     ),
   );
 
-  Widget _projectsPage(bool wide) => !_can(StudioPersona.viewProjects)
+  Widget _projectsPage(bool wide) =>
+      !_can(StudioPersona.viewProjects) &&
+          !_can(StudioPersona.viewMaterials) &&
+          !_can(StudioPersona.viewVendors) &&
+          !_can(StudioPersona.approveProcurement)
       ? _accessNotice()
-      : Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+      : Builder(
+          builder: (context) {
+            final tabs = [
+              if (_can(StudioPersona.viewProjects)) 'Projects',
+              if (_can(StudioPersona.viewProjects)) 'Schedule',
+              if (_can(StudioPersona.viewMaterials)) 'Materials',
+              if (_can(StudioPersona.viewVendors)) 'Vendors',
+              if (_can(StudioPersona.viewProcurement) ||
+                  _can(StudioPersona.approveProcurement))
+                'Procurement',
+            ];
+            final selectedTab = tabs.contains(_projectTab)
+                ? _projectTab
+                : tabs.first;
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _eyebrow('CONSTRUCTION WORKSPACE'),
+                const SizedBox(height: 8),
+                Text(
+                  selectedTab == 'Procurement'
+                      ? 'Procurement'
+                      : selectedTab == 'Materials' || selectedTab == 'Vendors'
+                      ? 'Master data'
+                      : 'Projects',
+                  style: _heading(30),
+                ),
+                const SizedBox(height: 7),
+                const Text(
+                  'Plan project work and keep shared construction records in one place.',
+                  style: TextStyle(
+                    fontFamily: 'Arial',
+                    color: muted,
+                    fontSize: 13,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: tabs
+                      .map(
+                        (tab) => ChoiceChip(
+                          label: Text(tab),
+                          selected: selectedTab == tab,
+                          onSelected: (_) => setState(() => _projectTab = tab),
+                        ),
+                      )
+                      .toList(),
+                ),
+                const SizedBox(height: 18),
+                switch (selectedTab) {
+                  'Projects' => _projectList(wide),
+                  'Schedule' => _schedulePage(),
+                  'Materials' => _materialsPage(),
+                  'Vendors' => _vendorsPage(),
+                  _ => _procurementPage(),
+                },
+              ],
+            );
+          },
+        );
+
+  Widget _procurementPage() {
+    final project = _selectedProject;
+    if (project == null) {
+      return _emptyDeliveryCard(
+        'Create a project first',
+        'Procurement records are organized by project.',
+      );
+    }
+    final requisitions = _delivery.requisitions
+        .where((item) => item.projectId == project.id)
+        .toList();
+    final rfqs = _delivery.rfqs
+        .where((item) => item.projectId == project.id)
+        .toList();
+    final quotes = _delivery.vendorQuotes
+        .where((item) => item.projectId == project.id)
+        .toList();
+    final purchaseOrders = _delivery.purchaseOrders
+        .where((item) => item.projectId == project.id)
+        .toList();
+    final manageable = _can(StudioPersona.manageProcurement);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
           children: [
-            _eyebrow('DESIGN, THROUGH EVERY DETAIL'),
-            const SizedBox(height: 8),
-            Text('Projects', style: _heading(30)),
-            const SizedBox(height: 7),
-            const Text(
-              'The spaces you’re bringing to life.',
-              style: TextStyle(fontFamily: 'Arial', color: muted, fontSize: 13),
+            Expanded(
+              child: DropdownButtonFormField<String>(
+                initialValue: project.id,
+                decoration: const InputDecoration(labelText: 'Project'),
+                items: _delivery.projects
+                    .map(
+                      (item) => DropdownMenuItem(
+                        value: item.id,
+                        child: Text(item.name, overflow: TextOverflow.ellipsis),
+                      ),
+                    )
+                    .toList(),
+                onChanged: (value) =>
+                    setState(() => _selectedProjectId = value),
+              ),
             ),
-            const SizedBox(height: 16),
-            if (_can(StudioPersona.manageProjects))
-              Align(
-                alignment: Alignment.centerRight,
-                child: FilledButton.icon(
-                  onPressed: _createProject,
-                  icon: const Icon(Icons.add, size: 17),
-                  label: const Text('New project'),
-                  style: FilledButton.styleFrom(backgroundColor: ink),
+            if (_can(StudioPersona.configureWorkspace)) ...[
+              const SizedBox(width: 10),
+              IconButton(
+                tooltip: 'Approval policy',
+                onPressed: _configureProcurementPolicy,
+                icon: const Icon(Icons.tune),
+              ),
+            ],
+            const SizedBox(width: 10),
+            IconButton(
+              tooltip: 'Procurement audit history',
+              onPressed: () => _openProcurementAudit(project),
+              icon: const Icon(Icons.history),
+            ),
+          ],
+        ),
+        const SizedBox(height: 18),
+        _procurementSection(
+          title: 'Material requisitions',
+          description: 'Request project materials and route decisions.',
+          action: manageable
+              ? OutlinedButton.icon(
+                  onPressed: () => _createRequisition(project),
+                  icon: const Icon(Icons.add, size: 16),
+                  label: const Text('New requisition'),
+                )
+              : null,
+          children: requisitions.isEmpty
+              ? [_procurementEmpty('No requisitions for this project.')]
+              : requisitions
+                    .map(
+                      (item) => _requisitionCard(item, canManage: manageable),
+                    )
+                    .toList(),
+        ),
+        const SizedBox(height: 18),
+        _procurementSection(
+          title: 'Vendor requests for quotation',
+          description: 'Issue approved requirements to selected vendors.',
+          action: manageable
+              ? OutlinedButton.icon(
+                  onPressed:
+                      requisitions.any((item) => item.status == 'Approved')
+                      ? () => _createRfq(project)
+                      : null,
+                  icon: const Icon(Icons.add, size: 16),
+                  label: const Text('New RFQ'),
+                )
+              : null,
+          children: rfqs.isEmpty
+              ? [_procurementEmpty('No vendor requests yet.')]
+              : rfqs
+                    .map((item) => _rfqCard(item, canManage: manageable))
+                    .toList(),
+        ),
+        const SizedBox(height: 18),
+        _procurementSection(
+          title: 'Quote comparison',
+          description: 'Compare submitted vendor quotes before selecting one.',
+          action: manageable
+              ? OutlinedButton.icon(
+                  onPressed: rfqs.any((item) => item.status == 'Issued')
+                      ? () => _createVendorQuote(project)
+                      : null,
+                  icon: const Icon(Icons.add, size: 16),
+                  label: const Text('Record quote'),
+                )
+              : null,
+          children: quotes.isEmpty
+              ? [_procurementEmpty('No vendor quotes have been recorded.')]
+              : quotes.map(_vendorQuoteCard).toList(),
+        ),
+        const SizedBox(height: 18),
+        _procurementSection(
+          title: 'Purchase orders',
+          description:
+              'Create orders from selected quotes and approve before issue.',
+          action: manageable
+              ? OutlinedButton.icon(
+                  onPressed: quotes.any((item) => item.status == 'Selected')
+                      ? () => _createPurchaseOrder(project)
+                      : null,
+                  icon: const Icon(Icons.add, size: 16),
+                  label: const Text('New purchase order'),
+                )
+              : null,
+          children: purchaseOrders.isEmpty
+              ? [_procurementEmpty('No purchase orders have been created.')]
+              : purchaseOrders
+                    .map(
+                      (item) => _purchaseOrderCard(item, canManage: manageable),
+                    )
+                    .toList(),
+        ),
+      ],
+    );
+  }
+
+  Widget _procurementSection({
+    required String title,
+    required String description,
+    required Widget? action,
+    required List<Widget> children,
+  }) => Container(
+    width: double.infinity,
+    padding: const EdgeInsets.all(18),
+    decoration: BoxDecoration(
+      color: paper,
+      borderRadius: BorderRadius.circular(14),
+      border: Border.all(color: line),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title, style: _heading(19)),
+                  const SizedBox(height: 4),
+                  Text(
+                    description,
+                    style: const TextStyle(
+                      fontFamily: 'Arial',
+                      color: muted,
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (action != null) action,
+          ],
+        ),
+        const SizedBox(height: 14),
+        ...children,
+      ],
+    ),
+  );
+
+  Widget _procurementEmpty(String message) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 10),
+    child: Text(
+      message,
+      style: const TextStyle(fontFamily: 'Arial', color: muted, fontSize: 12),
+    ),
+  );
+
+  Widget _requisitionCard(
+    StudioMaterialRequisition item, {
+    required bool canManage,
+  }) {
+    final project = _projectFor(item.projectId);
+    final pendingStep = item.approvalSteps
+        .where((step) => step.status == 'Pending')
+        .firstOrNull;
+    final canDecide =
+        pendingStep != null &&
+        _canProcurementPermission(pendingStep.permission);
+    return _procurementRecordCard(
+      title: item.title,
+      subtitle:
+          '${item.items.length} material line${item.items.length == 1 ? '' : 's'} · ${project?.name ?? ''}',
+      status: item.status,
+      detail: item.items
+          .map(
+            (line) =>
+                '${line.name}: ${line.quantity.toStringAsFixed(3)} ${line.unit}',
+          )
+          .join('  ·  '),
+      actions: [
+        if (item.status == 'Draft' && canManage)
+          _procurementButton('Submit', () => _submitRequisition(item)),
+        if (_can(StudioPersona.manageCommunications))
+          _procurementButton(
+            'Add communication',
+            () => _createCommunication(
+              projectId: item.projectId,
+              procurementRecordType: 'requisitions',
+              procurementRecordId: item.id,
+            ),
+          ),
+        if (canDecide) ...[
+          _procurementButton('Approve', () => _decideRequisition(item, true)),
+          _procurementButton('Reject', () => _decideRequisition(item, false)),
+        ],
+      ],
+    );
+  }
+
+  Widget _rfqCard(StudioRequestForQuotation item, {required bool canManage}) {
+    final requisition = _requisitionFor(item.requisitionId);
+    final vendors = item.vendorIds
+        .map(_vendorFor)
+        .whereType<StudioVendor>()
+        .map((vendor) => vendor.name)
+        .join(', ');
+    return _procurementRecordCard(
+      title: requisition?.title ?? 'Request for quotation',
+      subtitle: '$vendors · ${item.status}',
+      status: item.status,
+      detail: item.notes.isEmpty ? 'Vendors invited: $vendors' : item.notes,
+      actions: [
+        if (item.status == 'Draft' && canManage)
+          _procurementButton(
+            'Issue RFQ',
+            () => _changeRfqStatus(item, 'Issued'),
+          ),
+        if (item.status == 'Issued' && canManage)
+          _procurementButton(
+            'Close RFQ',
+            () => _changeRfqStatus(item, 'Closed'),
+          ),
+        if (_can(StudioPersona.manageCommunications))
+          for (final vendorId in item.vendorIds)
+            _procurementButton(
+              'Contact ${_vendorFor(vendorId)?.name ?? 'vendor'}',
+              () => _createCommunication(
+                projectId: item.projectId,
+                vendorId: vendorId,
+                procurementRecordType: 'rfqs',
+                procurementRecordId: item.id,
+              ),
+            ),
+      ],
+    );
+  }
+
+  Widget _vendorQuoteCard(StudioVendorQuote item) {
+    final vendor = _vendorFor(item.vendorId)?.name ?? 'Vendor';
+    final rfq = _rfqFor(item.rfqId);
+    final canSelect =
+        _can(StudioPersona.manageProcurement) && item.status == 'Submitted';
+    return _procurementRecordCard(
+      title: vendor,
+      subtitle:
+          '${_requisitionFor(rfq?.requisitionId ?? '')?.title ?? 'RFQ'} · ${item.status}',
+      status: item.status,
+      detail:
+          '${_formatMinor(item.totalMinor, item.currency)} · ${item.deliveryDays == null ? 'Delivery time not specified' : '${item.deliveryDays} day delivery'}${item.terms.isEmpty ? '' : ' · ${item.terms}'}',
+      actions: [
+        if (canSelect)
+          _procurementButton('Select quote', () => _selectVendorQuote(item)),
+        if (_can(StudioPersona.manageCommunications))
+          _procurementButton(
+            'Contact vendor',
+            () => _createCommunication(
+              projectId: item.projectId,
+              vendorId: item.vendorId,
+              procurementRecordType: 'vendorQuotes',
+              procurementRecordId: item.id,
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _purchaseOrderCard(
+    StudioPurchaseOrder item, {
+    required bool canManage,
+  }) {
+    final pendingStep = item.approvalSteps
+        .where((step) => step.status == 'Pending')
+        .firstOrNull;
+    final canDecide =
+        pendingStep != null &&
+        _canProcurementPermission(pendingStep.permission);
+    return _procurementRecordCard(
+      title:
+          '${_vendorFor(item.vendorId)?.name ?? 'Vendor'} · ${_formatMinor(item.totalMinor, item.currency)}',
+      subtitle: 'Purchase order ${item.id}',
+      status: item.status,
+      detail: item.notes,
+      actions: [
+        if (item.status == 'Draft' && canManage)
+          _procurementButton(
+            'Submit for approval',
+            () => _submitPurchaseOrder(item),
+          ),
+        if (canDecide) ...[
+          _procurementButton('Approve', () => _decidePurchaseOrder(item, true)),
+          _procurementButton('Reject', () => _decidePurchaseOrder(item, false)),
+        ],
+        if (item.status == 'Approved' && canManage)
+          _procurementButton('Issue', () => _issuePurchaseOrder(item)),
+        if (_can(StudioPersona.manageCommunications))
+          _procurementButton(
+            'Contact vendor',
+            () => _createCommunication(
+              projectId: item.projectId,
+              vendorId: item.vendorId,
+              procurementRecordType: 'purchaseOrders',
+              procurementRecordId: item.id,
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _procurementRecordCard({
+    required String title,
+    required String subtitle,
+    required String status,
+    required String detail,
+    required List<Widget> actions,
+  }) => Container(
+    width: double.infinity,
+    margin: const EdgeInsets.only(bottom: 8),
+    padding: const EdgeInsets.all(12),
+    decoration: BoxDecoration(
+      color: canvas,
+      borderRadius: BorderRadius.circular(10),
+      border: Border.all(color: line),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                title,
+                style: const TextStyle(
+                  fontFamily: 'Arial',
+                  color: ink,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
                 ),
               ),
-            const SizedBox(height: 14),
-            if (_delivery.projects.isEmpty)
-              _emptyDeliveryCard(
-                'No projects yet',
-                'Create a project to connect tasks, milestones, files, and approvals.',
-              )
-            else
-              LayoutBuilder(
-                builder: (context, constraints) {
-                  final count = wide
-                      ? 3
-                      : constraints.maxWidth < 530
-                      ? 1
-                      : 2;
-                  return GridView.builder(
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    itemCount: _delivery.projects.length,
-                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: count,
-                      crossAxisSpacing: 14,
-                      mainAxisSpacing: 14,
-                      mainAxisExtent: 205,
+            ),
+            Chip(
+              label: Text(status),
+              visualDensity: VisualDensity.compact,
+              labelStyle: const TextStyle(fontFamily: 'Arial', fontSize: 10),
+            ),
+          ],
+        ),
+        const SizedBox(height: 3),
+        Text(
+          subtitle,
+          style: const TextStyle(
+            fontFamily: 'Arial',
+            color: muted,
+            fontSize: 11,
+          ),
+        ),
+        if (detail.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          Text(
+            detail,
+            style: const TextStyle(fontFamily: 'Arial', fontSize: 11),
+          ),
+        ],
+        if (actions.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Wrap(spacing: 6, runSpacing: 4, children: actions),
+        ],
+      ],
+    ),
+  );
+
+  Widget _procurementButton(String label, VoidCallback onPressed) =>
+      TextButton(onPressed: onPressed, child: Text(label));
+
+  String _formatMinor(int amount, String currency) =>
+      '$currency ${(amount / 100).toStringAsFixed(2)}';
+
+  StudioMaterialRequisition? _requisitionFor(String id) {
+    for (final item in _delivery.requisitions) {
+      if (item.id == id) return item;
+    }
+    return null;
+  }
+
+  StudioRequestForQuotation? _rfqFor(String? id) {
+    if (id == null) return null;
+    for (final item in _delivery.rfqs) {
+      if (item.id == id) return item;
+    }
+    return null;
+  }
+
+  StudioVendor? _vendorFor(String id) {
+    for (final item in _delivery.vendors) {
+      if (item.id == id) return item;
+    }
+    return null;
+  }
+
+  bool _canProcurementPermission(String permission) => switch (permission) {
+    'procurement.approve' => _can(StudioPersona.approveProcurement),
+    'manageFinancials' => _can(StudioPersona.manageFinancials),
+    _ => false,
+  };
+
+  Future<void> _createRequisition(StudioProject project) async {
+    if (!_can(StudioPersona.manageProcurement)) return;
+    final materials = _delivery.materials
+        .where((item) => item.isActive)
+        .toList();
+    if (materials.isEmpty) {
+      _toast('Add an active material before creating a requisition.');
+      return;
+    }
+    final result = await showDialog<StudioMaterialRequisition>(
+      context: context,
+      builder: (context) =>
+          RequisitionEditorDialog(projectId: project.id, materials: materials),
+    );
+    if (result == null) return;
+    await _saveDelivery(
+      _delivery.copyWith(requisitions: [..._delivery.requisitions, result]),
+      confirmation: 'Requisition saved as a draft.',
+      activityTitle: 'Material requisition created',
+      activityDetails: '${project.name} · ${result.title}',
+    );
+  }
+
+  Future<void> _submitRequisition(StudioMaterialRequisition requisition) async {
+    final steps = _workspacePreferences
+        .procurementApprovalPolicy
+        .requisitionPermissions
+        .map(
+          (permission) => StudioProcurementApprovalStep(
+            permission: permission,
+            status: 'Pending',
+            decisionNote: '',
+            decidedAt: null,
+          ),
+        )
+        .toList();
+    final updated = requisition.copyWith(
+      status: 'Pending approval',
+      approvalSteps: steps,
+    );
+    await _saveDelivery(
+      _delivery.copyWith(
+        requisitions: [
+          for (final item in _delivery.requisitions)
+            if (item.id == requisition.id) updated else item,
+        ],
+      ),
+      confirmation: 'Requisition submitted for approval.',
+      activityTitle: 'Requisition submitted',
+      activityDetails: requisition.title,
+    );
+  }
+
+  Future<void> _decideRequisition(
+    StudioMaterialRequisition requisition,
+    bool approve,
+  ) async {
+    final note = await _procurementDecisionNote(approve);
+    if (note == null) return;
+    final steps = List<StudioProcurementApprovalStep>.of(
+      requisition.approvalSteps,
+    );
+    final index = steps.indexWhere((step) => step.status == 'Pending');
+    if (index < 0 || !_canProcurementPermission(steps[index].permission))
+      return;
+    steps[index] = StudioProcurementApprovalStep(
+      permission: steps[index].permission,
+      status: approve ? 'Approved' : 'Rejected',
+      decisionNote: note,
+      decidedAt: DateTime.now().toUtc(),
+    );
+    final updated = requisition.copyWith(
+      status: approve
+          ? steps.every((step) => step.status == 'Approved')
+                ? 'Approved'
+                : 'Pending approval'
+          : 'Rejected',
+      approvalSteps: steps,
+    );
+    await _saveDelivery(
+      _delivery.copyWith(
+        requisitions: [
+          for (final item in _delivery.requisitions)
+            if (item.id == requisition.id) updated else item,
+        ],
+      ),
+      confirmation: approve
+          ? 'Approval decision saved.'
+          : 'Requisition rejected.',
+      activityTitle: approve ? 'Requisition approved' : 'Requisition rejected',
+      activityDetails: requisition.title,
+    );
+  }
+
+  Future<String?> _procurementDecisionNote(bool approve) => showDialog<String>(
+    context: context,
+    builder: (context) => ProcurementDecisionDialog(approve: approve),
+  );
+
+  Future<void> _createRfq(StudioProject project) async {
+    if (!_can(StudioPersona.manageProcurement)) return;
+    final requisitions = _delivery.requisitions
+        .where(
+          (item) => item.projectId == project.id && item.status == 'Approved',
+        )
+        .toList();
+    final vendors = _delivery.vendors.where((item) => item.isActive).toList();
+    if (vendors.isEmpty) {
+      _toast('Add an active vendor before issuing a request for quotation.');
+      return;
+    }
+    final result = await showDialog<StudioRequestForQuotation>(
+      context: context,
+      builder: (context) => RequestForQuotationEditorDialog(
+        projectId: project.id,
+        requisitions: requisitions,
+        vendors: vendors,
+      ),
+    );
+    if (result == null) return;
+    await _saveDelivery(
+      _delivery.copyWith(rfqs: [..._delivery.rfqs, result]),
+      confirmation: 'Request for quotation saved as a draft.',
+      activityTitle: 'Vendor RFQ created',
+      activityDetails: '${project.name} · ${result.vendorIds.length} vendors',
+    );
+  }
+
+  Future<void> _changeRfqStatus(
+    StudioRequestForQuotation rfq,
+    String status,
+  ) async {
+    final updated = rfq.copyWith(status: status);
+    await _saveDelivery(
+      _delivery.copyWith(
+        rfqs: [
+          for (final item in _delivery.rfqs)
+            if (item.id == rfq.id) updated else item,
+        ],
+      ),
+      confirmation: status == 'Issued' ? 'RFQ issued.' : 'RFQ closed.',
+      activityTitle: status == 'Issued'
+          ? 'Vendor RFQ issued'
+          : 'Vendor RFQ closed',
+      activityDetails: _requisitionFor(rfq.requisitionId)?.title ?? rfq.id,
+    );
+  }
+
+  Future<void> _createVendorQuote(StudioProject project) async {
+    if (!_can(StudioPersona.manageProcurement)) return;
+    final rfqs = _delivery.rfqs
+        .where(
+          (item) => item.projectId == project.id && item.status == 'Issued',
+        )
+        .toList();
+    final result = await showDialog<StudioVendorQuote>(
+      context: context,
+      builder: (context) => VendorQuoteEditorDialog(
+        projectId: project.id,
+        rfqs: rfqs,
+        requisitions: _delivery.requisitions,
+        vendors: _delivery.vendors,
+      ),
+    );
+    if (result == null) return;
+    await _saveDelivery(
+      _delivery.copyWith(vendorQuotes: [..._delivery.vendorQuotes, result]),
+      confirmation: 'Vendor quote recorded.',
+      activityTitle: 'Vendor quote received',
+      activityDetails:
+          '${_vendorFor(result.vendorId)?.name ?? ''} · ${_formatMinor(result.totalMinor, result.currency)}',
+    );
+  }
+
+  Future<void> _selectVendorQuote(StudioVendorQuote quote) async {
+    if (!_can(StudioPersona.manageProcurement)) return;
+    final quotes = [
+      for (final item in _delivery.vendorQuotes)
+        if (item.rfqId == quote.rfqId && item.status == 'Selected')
+          item.copyWith(status: 'Not selected')
+        else if (item.id == quote.id)
+          item.copyWith(status: 'Selected')
+        else
+          item,
+    ];
+    await _saveDelivery(
+      _delivery.copyWith(vendorQuotes: quotes),
+      confirmation: 'Vendor quote selected for the purchase order.',
+      activityTitle: 'Vendor quote selected',
+      activityDetails:
+          '${_vendorFor(quote.vendorId)?.name ?? ''} · ${_formatMinor(quote.totalMinor, quote.currency)}',
+    );
+  }
+
+  Future<void> _createPurchaseOrder(StudioProject project) async {
+    if (!_can(StudioPersona.manageProcurement)) return;
+    final quotes = _delivery.vendorQuotes
+        .where(
+          (item) => item.projectId == project.id && item.status == 'Selected',
+        )
+        .toList();
+    final result = await showDialog<StudioPurchaseOrder>(
+      context: context,
+      builder: (context) => PurchaseOrderEditorDialog(
+        projectId: project.id,
+        quotes: quotes,
+        rfqs: _delivery.rfqs,
+        requisitions: _delivery.requisitions,
+      ),
+    );
+    if (result == null) return;
+    await _saveDelivery(
+      _delivery.copyWith(purchaseOrders: [..._delivery.purchaseOrders, result]),
+      confirmation: 'Purchase order saved as a draft.',
+      activityTitle: 'Purchase order created',
+      activityDetails:
+          '${_vendorFor(result.vendorId)?.name ?? ''} · ${_formatMinor(result.totalMinor, result.currency)}',
+    );
+  }
+
+  Future<void> _submitPurchaseOrder(StudioPurchaseOrder order) async {
+    final steps = _workspacePreferences
+        .procurementApprovalPolicy
+        .purchaseOrderPermissions
+        .map(
+          (permission) => StudioProcurementApprovalStep(
+            permission: permission,
+            status: 'Pending',
+            decisionNote: '',
+            decidedAt: null,
+          ),
+        )
+        .toList();
+    final updated = order.copyWith(
+      status: 'Pending approval',
+      approvalSteps: steps,
+    );
+    await _saveDelivery(
+      _delivery.copyWith(
+        purchaseOrders: [
+          for (final item in _delivery.purchaseOrders)
+            if (item.id == order.id) updated else item,
+        ],
+      ),
+      confirmation: 'Purchase order submitted for approval.',
+      activityTitle: 'Purchase order submitted',
+      activityDetails: order.id,
+    );
+  }
+
+  Future<void> _decidePurchaseOrder(
+    StudioPurchaseOrder order,
+    bool approve,
+  ) async {
+    final note = await _procurementDecisionNote(approve);
+    if (note == null) return;
+    final steps = List<StudioProcurementApprovalStep>.of(order.approvalSteps);
+    final index = steps.indexWhere((step) => step.status == 'Pending');
+    if (index < 0 || !_canProcurementPermission(steps[index].permission))
+      return;
+    steps[index] = StudioProcurementApprovalStep(
+      permission: steps[index].permission,
+      status: approve ? 'Approved' : 'Rejected',
+      decisionNote: note,
+      decidedAt: DateTime.now().toUtc(),
+    );
+    final updated = order.copyWith(
+      status: approve
+          ? steps.every((step) => step.status == 'Approved')
+                ? 'Approved'
+                : 'Pending approval'
+          : 'Rejected',
+      approvalSteps: steps,
+    );
+    await _saveDelivery(
+      _delivery.copyWith(
+        purchaseOrders: [
+          for (final item in _delivery.purchaseOrders)
+            if (item.id == order.id) updated else item,
+        ],
+      ),
+      confirmation: approve
+          ? 'Approval decision saved.'
+          : 'Purchase order rejected.',
+      activityTitle: approve
+          ? 'Purchase order approved'
+          : 'Purchase order rejected',
+      activityDetails: order.id,
+    );
+  }
+
+  Future<void> _issuePurchaseOrder(StudioPurchaseOrder order) async {
+    final updated = order.copyWith(
+      status: 'Issued',
+      issuedAt: DateTime.now().toUtc(),
+    );
+    await _saveDelivery(
+      _delivery.copyWith(
+        purchaseOrders: [
+          for (final item in _delivery.purchaseOrders)
+            if (item.id == order.id) updated else item,
+        ],
+      ),
+      confirmation: 'Purchase order issued.',
+      activityTitle: 'Purchase order issued',
+      activityDetails: order.id,
+    );
+  }
+
+  Future<void> _configureProcurementPolicy() async {
+    if (!_can(StudioPersona.configureWorkspace)) {
+      _toast('Workspace configuration permission is required.');
+      return;
+    }
+    final policy = await showDialog<StudioProcurementApprovalPolicy>(
+      context: context,
+      builder: (context) => ProcurementApprovalPolicyDialog(
+        policy: _workspacePreferences.procurementApprovalPolicy,
+      ),
+    );
+    if (policy == null) return;
+    await _saveWorkspace(
+      preferences: _workspacePreferences.copyWith(
+        procurementApprovalPolicy: policy,
+      ),
+      confirmation: 'Procurement approval policy updated.',
+    );
+  }
+
+  Future<void> _openProcurementAudit(StudioProject project) async {
+    if (_customerRepository is! RemoteCustomerWorkspaceRepository) {
+      _toast('Audit history is available in configured remote workspaces.');
+      return;
+    }
+    try {
+      final remoteRepository = _customerRepository;
+      final page = await remoteRepository.loadCollection(
+        collection: 'procurementAudit',
+        limit: 100,
+      );
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Procurement audit history'),
+          content: SizedBox(
+            width: 600,
+            child: page.records.isEmpty
+                ? const Text('No procurement decisions have been recorded.')
+                : SizedBox(
+                    height: 420,
+                    child: ListView.separated(
+                      itemCount: page.records.length,
+                      separatorBuilder: (_, _) => const Divider(height: 1),
+                      itemBuilder: (context, index) {
+                        final event = page.records[index];
+                        final createdAt = DateTime.tryParse(
+                          event['createdAt']?.toString() ?? '',
+                        );
+                        return ListTile(
+                          dense: true,
+                          title: Text(
+                            '${event['collection']} · ${event['action']}',
+                          ),
+                          subtitle: Text(
+                            '${event['recordId']}${createdAt == null ? '' : ' · ${MaterialLocalizations.of(context).formatMediumDate(createdAt.toLocal())}'}'
+                            '${event['fromStatus'] == null ? '' : ' · ${event['fromStatus']} -> ${event['toStatus']}'}',
+                          ),
+                        );
+                      },
                     ),
-                    itemBuilder: (context, index) =>
-                        _projectCard(_delivery.projects[index]),
-                  );
-                },
+                  ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      );
+    } on Exception catch (error) {
+      if (!mounted) return;
+      _toast('Could not load procurement audit history: $error');
+    }
+  }
+
+  Widget _projectList(bool wide) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      if (_can(StudioPersona.manageProjects))
+        Align(
+          alignment: Alignment.centerRight,
+          child: FilledButton.icon(
+            onPressed: _createProject,
+            icon: const Icon(Icons.add, size: 17),
+            label: const Text('New project'),
+            style: FilledButton.styleFrom(backgroundColor: ink),
+          ),
+        ),
+      const SizedBox(height: 14),
+      if (_delivery.projects.isEmpty)
+        _emptyDeliveryCard(
+          'No projects yet',
+          'Create a project to connect phases, tasks, milestones, files, and approvals.',
+        )
+      else
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final count = wide
+                ? 3
+                : constraints.maxWidth < 530
+                ? 1
+                : 2;
+            return GridView.builder(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              itemCount: _delivery.projects.length,
+              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: count,
+                crossAxisSpacing: 14,
+                mainAxisSpacing: 14,
+                mainAxisExtent: 205,
+              ),
+              itemBuilder: (context, index) =>
+                  _projectCard(_delivery.projects[index]),
+            );
+          },
+        ),
+    ],
+  );
+
+  Widget _schedulePage() {
+    final project = _selectedProject;
+    if (project == null) {
+      return _emptyDeliveryCard(
+        'No project schedule yet',
+        'Create a project to schedule phases, milestones, and tasks.',
+      );
+    }
+    final phases =
+        _delivery.phases
+            .where((phase) => phase.projectId == project.id)
+            .toList()
+          ..sort((first, second) => first.position.compareTo(second.position));
+    final entries =
+        <({DateTime? date, String kind, String title, String status})>[
+          for (final phase in phases)
+            (
+              date: phase.startDate,
+              kind: 'Phase',
+              title: phase.name,
+              status: phase.status,
+            ),
+          for (final milestone in _delivery.milestones.where(
+            (item) => item.projectId == project.id,
+          ))
+            (
+              date: milestone.dueDate,
+              kind: 'Milestone',
+              title: milestone.title,
+              status: milestone.status,
+            ),
+          for (final task in _delivery.tasks.where(
+            (item) => item.projectId == project.id,
+          ))
+            (
+              date: task.dueDate,
+              kind: 'Task',
+              title: task.title,
+              status: task.isComplete ? 'Complete' : task.priority,
+            ),
+        ]..sort((first, second) {
+          final firstDate = first.date ?? DateTime(9999);
+          final secondDate = second.date ?? DateTime(9999);
+          return firstDate.compareTo(secondDate);
+        });
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        DropdownButtonFormField<String>(
+          initialValue: project.id,
+          decoration: const InputDecoration(labelText: 'Project schedule'),
+          items: _delivery.projects
+              .map(
+                (item) =>
+                    DropdownMenuItem(value: item.id, child: Text(item.name)),
+              )
+              .toList(),
+          onChanged: (value) => setState(() => _selectedProjectId = value),
+        ),
+        const SizedBox(height: 14),
+        Wrap(
+          spacing: 10,
+          runSpacing: 8,
+          children: [
+            if (project.startDate != null)
+              _pill('Starts ${_dateLabel(project.startDate)}'),
+            if (project.targetDate != null)
+              _pill('Target ${_dateLabel(project.targetDate)}'),
+            if (_can(StudioPersona.viewFinancials) && project.budget != null)
+              _pill(
+                'Budget ${_formatCurrencyAmount(project.budget!, _financials.settings.currencySymbol)}',
               ),
           ],
-        );
+        ),
+        const SizedBox(height: 14),
+        Row(
+          children: [
+            Expanded(child: Text('Project phases', style: _heading(19))),
+            if (_can(StudioPersona.manageMilestones))
+              TextButton.icon(
+                onPressed: () => _createProjectPhase(project),
+                icon: const Icon(Icons.add, size: 16),
+                label: const Text('Add phase'),
+              ),
+          ],
+        ),
+        if (phases.isEmpty)
+          _emptyDeliveryCard(
+            'No phases defined',
+            'Add phases to organize work and relate milestones to the schedule.',
+          )
+        else
+          ...phases.map(
+            (phase) => Card(
+              color: paper,
+              child: ListTile(
+                leading: CircleAvatar(
+                  radius: 15,
+                  backgroundColor: line,
+                  child: Text('${phase.position + 1}'),
+                ),
+                title: Text(phase.name),
+                subtitle: Text(
+                  '${phase.status} · ${_dateLabel(phase.startDate)} – ${_dateLabel(phase.endDate)}',
+                ),
+                trailing: _can(StudioPersona.manageMilestones)
+                    ? IconButton(
+                        tooltip: 'Edit phase',
+                        onPressed: () => _editProjectPhase(phase),
+                        icon: const Icon(Icons.edit_outlined),
+                      )
+                    : null,
+              ),
+            ),
+          ),
+        const SizedBox(height: 14),
+        Text('Timeline', style: _heading(19)),
+        const SizedBox(height: 8),
+        if (entries.isEmpty)
+          _emptyDeliveryCard(
+            'Nothing scheduled',
+            'Set phase dates, task due dates, or milestone targets to build the timeline.',
+          )
+        else
+          ...entries.map(
+            (entry) => Container(
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              decoration: _cardDecoration(),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 92,
+                    child: Text(
+                      _dateLabel(entry.date),
+                      style: const TextStyle(
+                        fontFamily: 'Arial',
+                        color: muted,
+                        fontSize: 11,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(entry.title, style: const TextStyle(color: ink)),
+                        const SizedBox(height: 3),
+                        Text(
+                          entry.kind,
+                          style: const TextStyle(
+                            fontFamily: 'Arial',
+                            color: muted,
+                            fontSize: 10,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  _pill(entry.status),
+                ],
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _materialsPage() {
+    final materials = [..._delivery.materials]
+      ..sort(
+        (first, second) =>
+            first.name.toLowerCase().compareTo(second.name.toLowerCase()),
+      );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(child: Text('Material catalogue', style: _heading(20))),
+            if (_can(StudioPersona.manageMaterials))
+              FilledButton.icon(
+                onPressed: _createMaterial,
+                icon: const Icon(Icons.add, size: 16),
+                label: const Text('Add material'),
+                style: FilledButton.styleFrom(backgroundColor: ink),
+              ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        if (materials.isEmpty)
+          _emptyDeliveryCard(
+            'No materials yet',
+            'Add standardized material names, units, categories, and specifications.',
+          )
+        else
+          ...materials.map(
+            (material) => Container(
+              margin: const EdgeInsets.only(bottom: 9),
+              decoration: _cardDecoration(),
+              child: ListTile(
+                title: Text(material.name),
+                subtitle: Text(
+                  '${material.category} · ${material.unit}${material.specification.isEmpty ? '' : ' · ${material.specification}'}',
+                ),
+                leading: Icon(
+                  material.isActive
+                      ? Icons.inventory_2_outlined
+                      : Icons.archive_outlined,
+                  color: material.isActive ? sage : muted,
+                ),
+                trailing: _can(StudioPersona.manageMaterials)
+                    ? IconButton(
+                        tooltip: 'Edit material',
+                        onPressed: () => _editMaterial(material),
+                        icon: const Icon(Icons.edit_outlined),
+                      )
+                    : _pill(material.isActive ? 'Active' : 'Archived'),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _vendorsPage() {
+    final vendors = [..._delivery.vendors]
+      ..sort(
+        (first, second) =>
+            first.name.toLowerCase().compareTo(second.name.toLowerCase()),
+      );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text('Suppliers & contractors', style: _heading(20)),
+            ),
+            if (_can(StudioPersona.manageVendors))
+              FilledButton.icon(
+                onPressed: _createVendor,
+                icon: const Icon(Icons.add, size: 16),
+                label: const Text('Add vendor'),
+                style: FilledButton.styleFrom(backgroundColor: ink),
+              ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        if (vendors.isEmpty)
+          _emptyDeliveryCard(
+            'No vendors yet',
+            'Keep supplier and contractor contacts, payment terms, and document records here.',
+          )
+        else
+          ...vendors.map(
+            (vendor) => Container(
+              margin: const EdgeInsets.only(bottom: 9),
+              decoration: _cardDecoration(),
+              child: ListTile(
+                title: Text(vendor.name),
+                subtitle: Text(
+                  [
+                    vendor.kind,
+                    if (vendor.email.isNotEmpty) vendor.email,
+                    if (vendor.phone.isNotEmpty) vendor.phone,
+                    '${vendor.documents.length} document records',
+                  ].join(' · '),
+                ),
+                leading: Icon(
+                  vendor.kind == 'Contractor'
+                      ? Icons.engineering_outlined
+                      : Icons.storefront_outlined,
+                  color: sage,
+                ),
+                trailing: _can(StudioPersona.manageVendors)
+                    ? IconButton(
+                        tooltip: 'Edit vendor',
+                        onPressed: () => _editVendor(vendor),
+                        icon: const Icon(Icons.edit_outlined),
+                      )
+                    : _pill(vendor.isActive ? 'Active' : 'Archived'),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
 
   Widget _projectCard(StudioProject project) {
     final milestones = _delivery.milestones
@@ -4599,6 +6263,83 @@ class _StudioHomeState extends State<StudioHome> {
       ..sort((first, second) => second.updatedAt.compareTo(first.updatedAt));
     final invoices = List<StudioInvoice>.of(_financials.invoices)
       ..sort((first, second) => second.issuedAt.compareTo(first.issuedAt));
+    const tabs = [
+      ('Quotations', Icons.request_quote_outlined),
+      ('Proposals', Icons.description_outlined),
+      ('Invoices', Icons.receipt_long_outlined),
+      ('Line item catalog', Icons.inventory_2_outlined),
+      ('Finance', Icons.account_balance_wallet_outlined),
+    ];
+    final tabContent = switch (_proposalTab) {
+      'Quotations' => _financialSection(
+        'Bills of quantities & quotations',
+        'Itemized quantities, unit rates, tax, and totals',
+        quotations.isEmpty
+            ? _emptyDeliveryCard(
+                'No quotations yet',
+                canManage
+                    ? 'Create a quotation from a project linked to a client.'
+                    : 'Quotations will appear here when the studio creates them.',
+              )
+            : Column(children: quotations.map(_quotationRow).toList()),
+      ),
+      'Proposals' => _financialSection(
+        'Proposals',
+        'Client-ready snapshots using your studio template and layout',
+        proposals.isEmpty
+            ? _emptyDeliveryCard(
+                'No proposals yet',
+                'Generate a proposal from a saved quotation.',
+              )
+            : Column(children: proposals.map(_proposalRow).toList()),
+      ),
+      'Invoices' => _financialSection(
+        'Invoices & payments',
+        'Prepare invoices from approved proposals and track payment status',
+        invoices.isEmpty
+            ? _emptyDeliveryCard(
+                'No invoices yet',
+                'Approved proposals can be prepared as invoices.',
+              )
+            : Column(children: invoices.map(_invoiceRow).toList()),
+      ),
+      'Line item catalog' => _financialSection(
+        'Workspace line item catalog',
+        'Configure per-square-foot Basic, Medium, and Luxury rates for quotations',
+        LineItemCatalogPanel(
+          catalog: _lineItemCatalog,
+          currencySymbol: _financials.settings.currencySymbol,
+          canManage: canManage,
+          loading: _lineItemCatalogLoading,
+          error: _lineItemCatalogError,
+          onSave: _saveLineItemCatalogEntry,
+        ),
+      ),
+      _ => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (canManage)
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: _manageTemplates,
+                  icon: const Icon(Icons.article_outlined, size: 16),
+                  label: const Text('Document templates'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _editFinancialSettings,
+                  icon: const Icon(Icons.tune, size: 16),
+                  label: const Text('Proposal settings'),
+                ),
+              ],
+            ),
+          if (canManage) const SizedBox(height: 14),
+          _projectFinanceControls(canManage),
+        ],
+      ),
+    };
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -4612,7 +6353,7 @@ class _StudioHomeState extends State<StudioHome> {
         ),
         const SizedBox(height: 20),
         _metricGrid(wide, finance: true),
-        const SizedBox(height: 14),
+        const SizedBox(height: 18),
         Wrap(
           spacing: 8,
           runSpacing: 8,
@@ -4624,56 +6365,280 @@ class _StudioHomeState extends State<StudioHome> {
                 label: const Text('New quotation'),
                 style: FilledButton.styleFrom(backgroundColor: ink),
               ),
-            if (canManage)
-              OutlinedButton.icon(
-                onPressed: _manageTemplates,
-                icon: const Icon(Icons.article_outlined, size: 16),
-                label: const Text('Document templates'),
-              ),
-            if (canManage)
-              OutlinedButton.icon(
-                onPressed: _editFinancialSettings,
-                icon: const Icon(Icons.tune, size: 16),
-                label: const Text('Proposal settings'),
-              ),
           ],
         ),
         const SizedBox(height: 16),
-        _financialSection(
-          'Bills of quantities & quotations',
-          'Itemized quantities, unit rates, tax, and totals',
-          quotations.isEmpty
-              ? _emptyDeliveryCard(
-                  'No quotations yet',
-                  canManage
-                      ? 'Create a quotation from a project linked to a client.'
-                      : 'Quotations will appear here when the studio creates them.',
-                )
-              : Column(children: quotations.map(_quotationRow).toList()),
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            children: [
+              for (final (label, icon) in tabs)
+                Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: ChoiceChip(
+                    avatar: Icon(icon, size: 16),
+                    label: Text(label),
+                    selected: _proposalTab == label,
+                    onSelected: (_) {
+                      setState(() => _proposalTab = label);
+                      if (label == 'Line item catalog') {
+                        _loadLineItemCatalog();
+                      }
+                    },
+                    selectedColor: ink,
+                    labelStyle: TextStyle(
+                      color: _proposalTab == label ? paper : muted,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                    ),
+                    side: BorderSide(color: _proposalTab == label ? ink : line),
+                  ),
+                ),
+            ],
+          ),
         ),
-        const SizedBox(height: 14),
-        _financialSection(
-          'Proposals',
-          'Client-ready snapshots using your studio template and layout',
-          proposals.isEmpty
-              ? _emptyDeliveryCard(
-                  'No proposals yet',
-                  'Generate a proposal from a saved quotation.',
-                )
-              : Column(children: proposals.map(_proposalRow).toList()),
-        ),
-        const SizedBox(height: 14),
-        _financialSection(
-          'Invoices & payments',
-          'Prepare invoices from approved proposals and track payment status',
-          invoices.isEmpty
-              ? _emptyDeliveryCard(
-                  'No invoices yet',
-                  'Approved proposals can be prepared as invoices.',
-                )
-              : Column(children: invoices.map(_invoiceRow).toList()),
-        ),
+        const SizedBox(height: 12),
+        tabContent,
       ],
+    );
+  }
+
+  Widget _projectFinanceControls(bool canManage) {
+    final expenditures = _financials.projectExpenditures;
+    final bills = _financials.vendorBills;
+    final reconciliations = _financials.bankReconciliations;
+    return _financialSection(
+      'Project finance controls',
+      'Expenditure, vendor liabilities, PO/receipt matching, and reconciliation',
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (canManage)
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: _recordProjectExpenditure,
+                  icon: const Icon(Icons.payments_outlined, size: 16),
+                  label: const Text('Record expenditure'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _recordVendorBill,
+                  icon: const Icon(Icons.receipt_long_outlined, size: 16),
+                  label: const Text('Record vendor bill'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _recordBankReconciliation,
+                  icon: const Icon(Icons.account_balance_outlined, size: 16),
+                  label: const Text('Reconcile account'),
+                ),
+              ],
+            ),
+          const SizedBox(height: 10),
+          if (expenditures.isEmpty && bills.isEmpty && reconciliations.isEmpty)
+            _emptyDeliveryCard(
+              'No project finance records',
+              'Record expenditure or a matched vendor bill to establish the project ledger.',
+            )
+          else ...[
+            for (final item in expenditures)
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text(item.description),
+                subtitle: Text('${item.category} · ${item.reference}'),
+                trailing: Text(
+                  '${item.currency} ${(item.amountMinor / 100).toStringAsFixed(2)}',
+                ),
+              ),
+            for (final bill in bills)
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text('Vendor bill ${bill.billNumber}'),
+                subtitle: Text(
+                  '${bill.purchaseOrderId} · ${bill.receiptIds.length} receipt(s) · ${bill.status}',
+                ),
+                trailing: Text(
+                  '${bill.currency} ${(bill.amountMinor / 100).toStringAsFixed(2)}',
+                ),
+              ),
+            for (final item in reconciliations)
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text(item.accountName),
+                subtitle: Text(
+                  '${_dateLabel(item.statementDate)} · ${item.status}',
+                ),
+                trailing: Text(
+                  '${item.ledgerBalanceMinor == item.statementBalanceMinor ? 'Matched' : 'Difference'}',
+                ),
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Future<void> _recordProjectExpenditure() async {
+    if (_delivery.projects.isEmpty) {
+      _toast('Create a project before recording expenditure.');
+      return;
+    }
+    final values = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (_) => const SimpleMultiPromptDialog(
+        title: 'Project expenditure',
+        fields: [
+          'Project ID',
+          'Category',
+          'Description',
+          'Amount',
+          'Currency',
+          'Reference',
+        ],
+      ),
+    );
+    if (values == null) return;
+    final project = _delivery.projects
+        .where((item) => item.id == values['Project ID'])
+        .firstOrNull;
+    final amount = double.tryParse(values['Amount'] ?? '');
+    if (project == null || amount == null || amount < 0) {
+      _toast('Enter a valid project ID and non-negative amount.');
+      return;
+    }
+    final record = StudioProjectExpenditure(
+      id: 'expenditure-${DateTime.now().microsecondsSinceEpoch}',
+      projectId: project.id,
+      category: values['Category']!,
+      description: values['Description']!,
+      amountMinor: (amount * 100).round(),
+      currency:
+          (values['Currency']!.trim().isEmpty ? 'USD' : values['Currency']!)
+              .toUpperCase(),
+      occurredAt: DateTime.now().toUtc(),
+      reference: values['Reference']!,
+    );
+    await _saveFinancials(
+      _financials.copyWith(
+        projectExpenditures: [..._financials.projectExpenditures, record],
+      ),
+      confirmation: 'Project expenditure recorded.',
+      activityTitle: 'Project expenditure recorded',
+      activityDetails: '${project.name} · ${record.description}',
+    );
+  }
+
+  Future<void> _recordVendorBill() async {
+    final issuedOrders = _delivery.purchaseOrders
+        .where((order) => order.status == 'Issued')
+        .toList();
+    if (issuedOrders.isEmpty) {
+      _toast('Issue a purchase order before recording a vendor bill.');
+      return;
+    }
+    final values = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (_) => const SimpleMultiPromptDialog(
+        title: 'Vendor bill',
+        fields: [
+          'Purchase order ID',
+          'Receipt ID',
+          'Bill number',
+          'Amount',
+          'Currency',
+          'Vendor ID',
+        ],
+      ),
+    );
+    if (values == null) return;
+    final order = issuedOrders
+        .where((item) => item.id == values['Purchase order ID'])
+        .firstOrNull;
+    final receipt = _delivery.goodsReceipts
+        .where((item) => item.id == values['Receipt ID'])
+        .firstOrNull;
+    final amount = double.tryParse(values['Amount'] ?? '');
+    if (order == null ||
+        receipt == null ||
+        receipt.projectId != order.projectId ||
+        receipt.purchaseOrderId != order.id ||
+        amount == null ||
+        amount <= 0) {
+      _toast('The bill must match an issued PO and a linked goods receipt.');
+      return;
+    }
+    final bill = StudioVendorBill(
+      id: 'vendor-bill-${DateTime.now().microsecondsSinceEpoch}',
+      projectId: order.projectId,
+      vendorId: values['Vendor ID']!.isEmpty
+          ? order.vendorId
+          : values['Vendor ID']!,
+      purchaseOrderId: order.id,
+      receiptIds: [receipt.id],
+      billNumber: values['Bill number']!,
+      amountMinor: (amount * 100).round(),
+      currency:
+          (values['Currency']!.trim().isEmpty ? 'USD' : values['Currency']!)
+              .toUpperCase(),
+      status: 'Open',
+      dueAt: null,
+    );
+    await _saveFinancials(
+      _financials.copyWith(vendorBills: [..._financials.vendorBills, bill]),
+      confirmation: 'Vendor bill recorded and matched.',
+      activityTitle: 'Vendor bill recorded',
+      activityDetails: '${bill.billNumber} · ${bill.purchaseOrderId}',
+    );
+  }
+
+  Future<void> _recordBankReconciliation() async {
+    final values = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (_) => const SimpleMultiPromptDialog(
+        title: 'Bank reconciliation',
+        fields: [
+          'Project ID',
+          'Account name',
+          'Statement balance',
+          'Ledger balance',
+        ],
+      ),
+    );
+    if (values == null) return;
+    final project = _delivery.projects
+        .where((item) => item.id == values['Project ID'])
+        .firstOrNull;
+    final statement = double.tryParse(values['Statement balance'] ?? '');
+    final ledger = double.tryParse(values['Ledger balance'] ?? '');
+    if (project == null || statement == null || ledger == null) {
+      _toast('Enter a valid project ID and both balances.');
+      return;
+    }
+    final statementMinor = (statement * 100).round();
+    final ledgerMinor = (ledger * 100).round();
+    final reconciliation = StudioBankReconciliation(
+      id: 'reconciliation-${DateTime.now().microsecondsSinceEpoch}',
+      projectId: project.id,
+      accountName: values['Account name']!,
+      statementDate: DateTime.now().toUtc(),
+      statementBalanceMinor: statementMinor,
+      ledgerBalanceMinor: ledgerMinor,
+      status: statementMinor == ledgerMinor ? 'Matched' : 'Difference',
+    );
+    await _saveFinancials(
+      _financials.copyWith(
+        bankReconciliations: [
+          ..._financials.bankReconciliations,
+          reconciliation,
+        ],
+      ),
+      confirmation: 'Bank reconciliation recorded.',
+      activityTitle: 'Bank reconciliation recorded',
+      activityDetails: '${project.name} · ${reconciliation.status}',
     );
   }
 
@@ -5284,6 +7249,10 @@ class _StudioHomeState extends State<StudioHome> {
               : Column(children: workLogs.map(_workLogRow).toList()),
         ),
         const SizedBox(height: 14),
+        _siteExecutionPanel(project),
+        const SizedBox(height: 14),
+        _workforcePanel(project),
+        const SizedBox(height: 14),
         _attendancePanel(),
         const SizedBox(height: 14),
         _deliveryPanel(
@@ -5305,6 +7274,613 @@ class _StudioHomeState extends State<StudioHome> {
               : Column(children: approvals.map(_approvalRow).toList()),
         ),
       ],
+    );
+  }
+
+  Future<void> _createGoodsReceipt(StudioProject project) async {
+    final issuedOrders = _delivery.purchaseOrders
+        .where(
+          (order) => order.projectId == project.id && order.status == 'Issued',
+        )
+        .toList();
+    if (issuedOrders.isEmpty) {
+      _toast('Issue a purchase order before recording goods received.');
+      return;
+    }
+    final values = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (_) => SimpleMultiPromptDialog(
+        title: 'Goods receipt',
+        fields: const [
+          'Purchase order ID',
+          'Location',
+          'Purchase order line ID',
+          'Received quantity',
+          'Accepted quantity',
+          'Notes',
+        ],
+      ),
+    );
+    if (values == null) return;
+    final order = issuedOrders
+        .where((item) => item.id == values['Purchase order ID'])
+        .firstOrNull;
+    final lineId = values['Purchase order line ID'];
+    final quantity = double.tryParse(values['Received quantity'] ?? '');
+    final accepted = double.tryParse(values['Accepted quantity'] ?? '');
+    if (order == null ||
+        lineId == null ||
+        quantity == null ||
+        accepted == null ||
+        !order.items.any((line) => line.requisitionLineId == lineId) ||
+        quantity <= 0 ||
+        accepted < 0 ||
+        accepted > quantity) {
+      _toast(
+        'Use an issued PO and a matching PO line; accepted quantity cannot exceed received quantity.',
+      );
+      return;
+    }
+    final receipt = StudioGoodsReceipt(
+      id: 'receipt-${DateTime.now().microsecondsSinceEpoch}',
+      projectId: project.id,
+      purchaseOrderId: order.id,
+      location: values['Location']!.trim(),
+      notes: values['Notes']!.trim(),
+      status: accepted == quantity ? 'Complete' : 'Partial',
+      lines: [
+        StudioGoodsReceiptLine(
+          purchaseOrderLineId: lineId,
+          quantityMilli: (quantity * 1000).round(),
+          acceptedQuantityMilli: (accepted * 1000).round(),
+        ),
+      ],
+      receivedAt: DateTime.now().toUtc(),
+    );
+    await _saveDelivery(
+      _delivery.copyWith(goodsReceipts: [..._delivery.goodsReceipts, receipt]),
+      confirmation: 'Goods receipt recorded.',
+      activityTitle: 'Goods receipt recorded',
+      activityDetails: '${project.name} · ${order.id} · $lineId',
+    );
+  }
+
+  Future<void> _createStockMovement(StudioProject project) async {
+    final values = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (_) => SimpleMultiPromptDialog(
+        title: 'Stock movement',
+        fields: const [
+          'Material ID',
+          'Kind (Receipt, Transfer, Consumption, Adjustment)',
+          'From location',
+          'To location',
+          'Quantity',
+          'Reference',
+          'Notes',
+        ],
+      ),
+    );
+    if (values == null) return;
+    final quantity = double.tryParse(values['Quantity'] ?? '');
+    final kind = values['Kind (Receipt, Transfer, Consumption, Adjustment)'];
+    if (quantity == null ||
+        quantity <= 0 ||
+        !const [
+          'Receipt',
+          'Transfer',
+          'Consumption',
+          'Adjustment',
+        ].contains(kind)) {
+      _toast('Enter a valid stock kind and quantity.');
+      return;
+    }
+    final movement = StudioStockMovement(
+      id: 'stock-${DateTime.now().microsecondsSinceEpoch}',
+      projectId: project.id,
+      materialId: values['Material ID']!,
+      kind: kind!,
+      fromLocation: values['From location']!.trim().isEmpty
+          ? null
+          : values['From location']!.trim(),
+      toLocation: values['To location']!.trim().isEmpty
+          ? null
+          : values['To location']!.trim(),
+      quantityMilli: (quantity * 1000).round(),
+      reference: values['Reference']!.trim(),
+      notes: values['Notes']!.trim(),
+      occurredAt: DateTime.now().toUtc(),
+    );
+    final movements = [..._delivery.stockMovements, movement];
+    final existing = _delivery.stockBalances
+        .where(
+          (balance) =>
+              balance.projectId == project.id &&
+              balance.materialId == movement.materialId &&
+              balance.location ==
+                  (movement.toLocation ?? movement.fromLocation ?? ''),
+        )
+        .firstOrNull;
+    final balances = _delivery.stockBalances
+        .where(
+          (balance) =>
+              !(balance.projectId == project.id &&
+                  balance.materialId == movement.materialId &&
+                  balance.location ==
+                      (movement.toLocation ?? movement.fromLocation ?? '')),
+        )
+        .toList();
+    final delta = kind == 'Consumption'
+        ? -movement.quantityMilli
+        : movement.quantityMilli;
+    balances.add(
+      StudioStockBalance(
+        id:
+            existing?.id ??
+            'stock-balance-${DateTime.now().microsecondsSinceEpoch}',
+        projectId: project.id,
+        materialId: movement.materialId,
+        location: movement.toLocation ?? movement.fromLocation ?? 'Site',
+        quantityMilli: (existing?.quantityMilli ?? 0) + delta,
+      ),
+    );
+    await _saveDelivery(
+      _delivery.copyWith(stockMovements: movements, stockBalances: balances),
+      confirmation: 'Stock movement recorded.',
+      activityTitle: 'Stock movement recorded',
+      activityDetails: '${project.name} · ${movement.kind} · $kind',
+    );
+  }
+
+  Future<void> _createWorkOrder(StudioProject project) async {
+    final values = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (_) => const SimpleMultiPromptDialog(
+        title: 'Work order',
+        fields: ['Title', 'Contractor', 'Scope', 'Priority'],
+      ),
+    );
+    if (values == null || values['Title']!.isEmpty) return;
+    final order = StudioWorkOrder(
+      id: 'work-order-${DateTime.now().microsecondsSinceEpoch}',
+      projectId: project.id,
+      title: values['Title']!,
+      contractor: values['Contractor']!,
+      scope: values['Scope']!,
+      status: 'Open',
+      priority: values['Priority']!.isEmpty ? 'Normal' : values['Priority']!,
+      startDate: null,
+      dueDate: null,
+    );
+    await _saveDelivery(
+      _delivery.copyWith(workOrders: [..._delivery.workOrders, order]),
+      confirmation: 'Work order created.',
+      activityTitle: 'Work order created',
+      activityDetails: '${project.name} · ${order.title}',
+    );
+  }
+
+  Future<void> _createDailyReport(StudioProject project) async {
+    final values = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (_) => const SimpleMultiPromptDialog(
+        title: 'Daily project report',
+        fields: ['Summary', 'Weather', 'Workforce count', 'Delays'],
+      ),
+    );
+    if (values == null || values['Summary']!.isEmpty) return;
+    final workforce = int.tryParse(values['Workforce count'] ?? '') ?? 0;
+    if (workforce < 0) {
+      _toast('Workforce count cannot be negative.');
+      return;
+    }
+    final report = StudioDailyReport(
+      id: 'daily-${DateTime.now().microsecondsSinceEpoch}',
+      projectId: project.id,
+      reportDate: DateTime.now().toUtc(),
+      summary: values['Summary']!,
+      weather: values['Weather']!,
+      workforceCount: workforce,
+      delays: values['Delays']!,
+    );
+    await _saveDelivery(
+      _delivery.copyWith(dailyReports: [..._delivery.dailyReports, report]),
+      confirmation: 'Daily report recorded.',
+      activityTitle: 'Daily project report recorded',
+      activityDetails: '${project.name} · ${report.summary}',
+    );
+  }
+
+  Future<void> _createSiteInspection(StudioProject project) async {
+    final values = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (_) => const SimpleMultiPromptDialog(
+        title: 'Site inspection',
+        fields: ['Title', 'Kind (Quality or Safety)', 'Inspector', 'Findings'],
+      ),
+    );
+    if (values == null || values['Title']!.isEmpty) return;
+    final kind = values['Kind (Quality or Safety)'];
+    if (!const ['Quality', 'Safety'].contains(kind)) {
+      _toast('Inspection kind must be Quality or Safety.');
+      return;
+    }
+    final inspection = StudioSiteInspection(
+      id: 'inspection-${DateTime.now().microsecondsSinceEpoch}',
+      projectId: project.id,
+      title: values['Title']!,
+      kind: kind!,
+      status: 'Open',
+      inspector: values['Inspector']!,
+      findings: values['Findings']!,
+      inspectedAt: DateTime.now().toUtc(),
+    );
+    await _saveDelivery(
+      _delivery.copyWith(
+        siteInspections: [..._delivery.siteInspections, inspection],
+      ),
+      confirmation: 'Site inspection recorded.',
+      activityTitle: 'Site inspection recorded',
+      activityDetails: '${project.name} · ${inspection.title}',
+    );
+  }
+
+  Widget _workforcePanel(StudioProject project) {
+    final workers = _delivery.workers;
+    final allocations = _delivery.workforceAllocations
+        .where((item) => item.projectId == project.id)
+        .toList();
+    final attendance = _delivery.siteAttendance
+        .where((item) => item.projectId == project.id)
+        .toList();
+    return _deliveryPanel(
+      'Workforce & attendance',
+      'Employee and contractor records, allocations, and site attendance',
+      onAdd: _can(StudioPersona.manageAttendance)
+          ? () => _createWorker()
+          : null,
+      addLabel: 'Add worker',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (_can(StudioPersona.manageAttendance)) ...[
+            OutlinedButton.icon(
+              onPressed: () => _allocateWorker(project),
+              icon: const Icon(Icons.assignment_ind_outlined, size: 16),
+              label: const Text('Allocate worker'),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: () => _recordSiteAttendance(project),
+              icon: const Icon(Icons.how_to_reg_outlined, size: 16),
+              label: const Text('Record attendance'),
+            ),
+          ],
+          const SizedBox(height: 10),
+          if (workers.isEmpty)
+            _procurementEmpty('No worker or contractor records.')
+          else
+            for (final worker in workers)
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text(worker.name),
+                subtitle: Text(
+                  '${worker.kind} · ${worker.role} · ${worker.status}',
+                ),
+              ),
+          if (allocations.isNotEmpty)
+            for (final allocation in allocations)
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text(
+                  workers
+                          .where((worker) => worker.id == allocation.workerId)
+                          .firstOrNull
+                          ?.name ??
+                      allocation.workerId,
+                ),
+                subtitle: Text(_dateLabel(allocation.startDate)),
+              ),
+          if (attendance.isNotEmpty)
+            for (final entry in attendance)
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text(
+                  workers
+                          .where((worker) => worker.id == entry.workerId)
+                          .firstOrNull
+                          ?.name ??
+                      entry.workerId,
+                ),
+                subtitle: Text('${_dateLabel(entry.date)} · ${entry.status}'),
+              ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _createWorker() async {
+    final values = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (_) => const SimpleMultiPromptDialog(
+        title: 'Worker or contractor',
+        fields: [
+          'Name',
+          'Kind (Employee or Contractor)',
+          'Role',
+          'Phone',
+          'Email',
+        ],
+      ),
+    );
+    if (values == null || values['Name']!.isEmpty) return;
+    final kind = values['Kind (Employee or Contractor)'];
+    if (!const ['Employee', 'Contractor'].contains(kind)) {
+      _toast('Worker kind must be Employee or Contractor.');
+      return;
+    }
+    final worker = StudioWorker(
+      id: 'worker-${DateTime.now().microsecondsSinceEpoch}',
+      name: values['Name']!,
+      kind: kind!,
+      role: values['Role']!,
+      phone: values['Phone']!,
+      email: values['Email']!,
+      status: 'Active',
+    );
+    await _saveDelivery(
+      _delivery.copyWith(workers: [..._delivery.workers, worker]),
+      confirmation: 'Worker record added.',
+      activityTitle: 'Worker record added',
+      activityDetails: worker.name,
+    );
+  }
+
+  Future<void> _allocateWorker(StudioProject project) async {
+    final workers = _delivery.workers
+        .where((worker) => worker.status == 'Active')
+        .toList();
+    if (workers.isEmpty) {
+      _toast('Add an active worker before allocation.');
+      return;
+    }
+    final values = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (_) => const SimpleMultiPromptDialog(
+        title: 'Allocate worker',
+        fields: ['Worker ID', 'Notes'],
+      ),
+    );
+    if (values == null) return;
+    final worker = workers
+        .where((item) => item.id == values['Worker ID'])
+        .firstOrNull;
+    if (worker == null) {
+      _toast('Enter a valid active worker ID.');
+      return;
+    }
+    await _saveDelivery(
+      _delivery.copyWith(
+        workforceAllocations: [
+          ..._delivery.workforceAllocations,
+          StudioWorkforceAllocation(
+            id: 'allocation-${DateTime.now().microsecondsSinceEpoch}',
+            workerId: worker.id,
+            projectId: project.id,
+            startDate: DateTime.now().toUtc(),
+            endDate: null,
+            notes: values['Notes']!,
+          ),
+        ],
+      ),
+      confirmation: 'Worker allocated to project.',
+      activityTitle: 'Worker allocated',
+      activityDetails: '${project.name} · ${worker.name}',
+    );
+  }
+
+  Future<void> _recordSiteAttendance(StudioProject project) async {
+    final workers = _delivery.workers
+        .where((worker) => worker.status == 'Active')
+        .toList();
+    if (workers.isEmpty) {
+      _toast('Add an active worker before recording attendance.');
+      return;
+    }
+    final values = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (_) => const SimpleMultiPromptDialog(
+        title: 'Site attendance',
+        fields: ['Worker ID', 'Status (Present, Late, Away, Remote)', 'Note'],
+      ),
+    );
+    if (values == null) return;
+    final worker = workers
+        .where((item) => item.id == values['Worker ID'])
+        .firstOrNull;
+    final status = values['Status (Present, Late, Away, Remote)'];
+    if (worker == null ||
+        !const ['Present', 'Late', 'Away', 'Remote'].contains(status)) {
+      _toast('Enter a valid worker ID and attendance status.');
+      return;
+    }
+    await _saveDelivery(
+      _delivery.copyWith(
+        siteAttendance: [
+          ..._delivery.siteAttendance,
+          StudioSiteAttendance(
+            id: 'attendance-${DateTime.now().microsecondsSinceEpoch}',
+            workerId: worker.id,
+            projectId: project.id,
+            date: DateTime.now().toUtc(),
+            status: status!,
+            checkIn: status == 'Away' ? null : DateTime.now().toUtc(),
+            checkOut: null,
+            note: values['Note']!,
+          ),
+        ],
+      ),
+      confirmation: 'Site attendance recorded.',
+      activityTitle: 'Workforce attendance recorded',
+      activityDetails: '${project.name} · ${worker.name} · $status',
+    );
+  }
+
+  Widget _siteExecutionPanel(StudioProject project) {
+    final receipts = _delivery.goodsReceipts
+        .where((item) => item.projectId == project.id)
+        .toList();
+    final movements = _delivery.stockMovements
+        .where((item) => item.projectId == project.id)
+        .toList();
+    final workOrders = _delivery.workOrders
+        .where((item) => item.projectId == project.id)
+        .toList();
+    final reports = _delivery.dailyReports
+        .where((item) => item.projectId == project.id)
+        .toList();
+    final inspections = _delivery.siteInspections
+        .where((item) => item.projectId == project.id)
+        .toList();
+    final balances = _delivery.stockBalances
+        .where((item) => item.projectId == project.id)
+        .toList();
+
+    return _deliveryPanel(
+      'Inventory & site execution',
+      'Receipts, stock, work orders, reports, and inspections',
+      onAdd: _can(StudioPersona.manageMaterials)
+          ? () => _createDailyReport(project)
+          : null,
+      addLabel: 'Add daily report',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              if (_can(StudioPersona.manageMaterials))
+                OutlinedButton.icon(
+                  onPressed: () => _createGoodsReceipt(project),
+                  icon: const Icon(Icons.inventory_2_outlined, size: 16),
+                  label: const Text('Goods receipt'),
+                ),
+              if (_can(StudioPersona.manageMaterials))
+                OutlinedButton.icon(
+                  onPressed: () => _createStockMovement(project),
+                  icon: const Icon(Icons.swap_horiz, size: 16),
+                  label: const Text('Stock movement'),
+                ),
+              if (_can(StudioPersona.manageProjects))
+                OutlinedButton.icon(
+                  onPressed: () => _createWorkOrder(project),
+                  icon: const Icon(Icons.engineering_outlined, size: 16),
+                  label: const Text('Work order'),
+                ),
+              if (_can(StudioPersona.managePunchList))
+                OutlinedButton.icon(
+                  onPressed: () => _createSiteInspection(project),
+                  icon: const Icon(Icons.fact_check_outlined, size: 16),
+                  label: const Text('Inspection'),
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text('Stock balances', style: _heading(15)),
+          const SizedBox(height: 6),
+          if (balances.isEmpty)
+            _procurementEmpty('No stock balances recorded.')
+          else
+            for (final balance in balances)
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text(
+                  _delivery.materials
+                          .where(
+                            (material) => material.id == balance.materialId,
+                          )
+                          .firstOrNull
+                          ?.name ??
+                      balance.materialId,
+                ),
+                subtitle: Text(balance.location),
+                trailing: Text(
+                  balance.quantity.toStringAsFixed(3),
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+          if (receipts.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text('Goods receipts', style: _heading(15)),
+            for (final receipt in receipts)
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text(receipt.purchaseOrderId),
+                subtitle: Text(
+                  '${receipt.location} · ${receipt.status} · ${receipt.lines.length} line(s)',
+                ),
+              ),
+          ],
+          if (movements.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text('Stock movements', style: _heading(15)),
+            for (final movement in movements)
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text(movement.kind),
+                subtitle: Text(
+                  '${movement.fromLocation ?? ''}${movement.fromLocation == null ? '' : ' -> '}${movement.toLocation ?? ''} · ${movement.quantityMilli / 1000} · ${movement.notes}',
+                ),
+              ),
+          ],
+          if (workOrders.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text('Work orders', style: _heading(15)),
+            for (final order in workOrders)
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text(order.title),
+                subtitle: Text(
+                  '${order.contractor} · ${order.status} · ${order.priority}',
+                ),
+              ),
+          ],
+          if (reports.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text('Daily reports', style: _heading(15)),
+            for (final report in reports)
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text(_dateLabel(report.reportDate)),
+                subtitle: Text(
+                  '${report.weather} · ${report.workforceCount} workforce · ${report.summary}',
+                ),
+              ),
+          ],
+          if (inspections.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text('Inspections', style: _heading(15)),
+            for (final inspection in inspections)
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text(inspection.title),
+                subtitle: Text(
+                  '${inspection.kind} · ${inspection.status} · ${inspection.inspector}',
+                ),
+              ),
+          ],
+        ],
+      ),
     );
   }
 
@@ -6030,6 +8606,42 @@ class _StudioHomeState extends State<StudioHome> {
     );
   }
 
+  Future<void> _recordReportSnapshot() async {
+    final values = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (_) => const SimpleMultiPromptDialog(
+        title: 'Report snapshot',
+        fields: ['Project ID', 'Kind', 'Summary'],
+      ),
+    );
+    if (values == null) return;
+    final project = _delivery.projects
+        .where((item) => item.id == values['Project ID'])
+        .firstOrNull;
+    if (project == null) {
+      _toast('Enter a valid project ID.');
+      return;
+    }
+    final now = DateTime.now().toUtc();
+    final snapshot = StudioReportSnapshot(
+      id: 'report-${now.microsecondsSinceEpoch}',
+      projectId: project.id,
+      kind: values['Kind']!.isEmpty ? 'Operational' : values['Kind']!,
+      periodStart: DateTime(now.year, now.month, 1).toUtc(),
+      periodEnd: now,
+      summary: values['Summary']!,
+      createdAt: now,
+    );
+    await _saveDelivery(
+      _delivery.copyWith(
+        reportSnapshots: [..._delivery.reportSnapshots, snapshot],
+      ),
+      confirmation: 'Report snapshot created.',
+      activityTitle: 'Operational report snapshot created',
+      activityDetails: '${project.name} · ${snapshot.kind}',
+    );
+  }
+
   Widget _reportsPage(bool wide) {
     final canViewClients = _can(StudioPersona.viewClients);
     final canViewProjects = _can(StudioPersona.viewProjects);
@@ -6160,6 +8772,48 @@ class _StudioHomeState extends State<StudioHome> {
           },
         ),
         const SizedBox(height: 16),
+        _financialSection(
+          'Imports & report snapshots',
+          'Validated import history and authorized dated operational reports',
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (_delivery.importRecords.isEmpty &&
+                  _delivery.reportSnapshots.isEmpty)
+                _emptyDeliveryCard(
+                  'No import or report history',
+                  'New imports and generated reports will retain an auditable snapshot here.',
+                )
+              else ...[
+                for (final record in _delivery.importRecords)
+                  ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(record.fileName),
+                    subtitle: Text(
+                      '${record.kind} · ${record.status} · ${record.importedCount} imported · ${record.failedCount} failed',
+                    ),
+                  ),
+                for (final report in _delivery.reportSnapshots)
+                  ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    title: Text('${report.kind} report'),
+                    subtitle: Text(
+                      '${_dateLabel(report.periodStart)} – ${_dateLabel(report.periodEnd)} · ${report.summary}',
+                    ),
+                  ),
+              ],
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: _recordReportSnapshot,
+                icon: const Icon(Icons.summarize_outlined, size: 16),
+                label: const Text('Create report snapshot'),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 14),
         Container(
           padding: const EdgeInsets.all(20),
           decoration: _cardDecoration(),
@@ -6301,7 +8955,7 @@ class _StudioHomeState extends State<StudioHome> {
         rows.add([
           'Task',
           task.id,
-          task.assignee,
+          task.assignee.isEmpty ? 'Unassigned' : task.assignee,
           _projectFor(task.projectId)?.name ?? '',
           task.isComplete ? 'Complete' : 'Open',
           '',
@@ -8422,10 +11076,14 @@ class ProjectEditorDialog extends StatefulWidget {
   const ProjectEditorDialog({
     super.key,
     required this.customers,
+    required this.canViewBudget,
+    required this.canManageBudget,
     required this.project,
   });
 
   final List<Customer> customers;
+  final bool canViewBudget;
+  final bool canManageBudget;
   final StudioProject project;
 
   @override
@@ -8436,8 +11094,10 @@ class _ProjectEditorDialogState extends State<ProjectEditorDialog> {
   final _formKey = GlobalKey<FormState>();
   late final TextEditingController _name;
   late final TextEditingController _location;
+  late final TextEditingController _budget;
   late String _status;
   late String _customerId;
+  DateTime? _startDate;
   DateTime? _targetDate;
 
   @override
@@ -8445,8 +11105,12 @@ class _ProjectEditorDialogState extends State<ProjectEditorDialog> {
     super.initState();
     _name = TextEditingController(text: widget.project.name);
     _location = TextEditingController(text: widget.project.location);
+    _budget = TextEditingController(
+      text: widget.project.budget?.toStringAsFixed(2) ?? '',
+    );
     _status = widget.project.status;
     _customerId = widget.project.customerId ?? '';
+    _startDate = widget.project.startDate;
     _targetDate = widget.project.targetDate;
   }
 
@@ -8454,11 +11118,27 @@ class _ProjectEditorDialogState extends State<ProjectEditorDialog> {
   void dispose() {
     _name.dispose();
     _location.dispose();
+    _budget.dispose();
     super.dispose();
   }
 
   void _save() {
     if (!_formKey.currentState!.validate()) return;
+    final budget = widget.canManageBudget
+        ? _budget.text.trim().isEmpty
+              ? null
+              : double.parse(_budget.text.trim())
+        : widget.project.budget;
+    if (_startDate != null &&
+        _targetDate != null &&
+        _startDate!.isAfter(_targetDate!)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('The target date must follow the start date.'),
+        ),
+      );
+      return;
+    }
     Navigator.pop(
       context,
       StudioProject(
@@ -8468,6 +11148,8 @@ class _ProjectEditorDialogState extends State<ProjectEditorDialog> {
         status: _status,
         customerId: _customerId.isEmpty ? null : _customerId,
         targetDate: _targetDate,
+        budget: budget,
+        startDate: _startDate,
       ),
     );
   }
@@ -8497,11 +11179,34 @@ class _ProjectEditorDialogState extends State<ProjectEditorDialog> {
               ),
               TextField(
                 controller: _location,
-                maxLength: 120,
+                maxLength: 200,
                 decoration: const InputDecoration(
-                  labelText: 'Location or project type',
+                  labelText: 'Site address or location',
                 ),
               ),
+              if (widget.canViewBudget)
+                TextFormField(
+                  controller: _budget,
+                  readOnly: !widget.canManageBudget,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  decoration: const InputDecoration(
+                    labelText: 'Project budget (optional)',
+                  ),
+                  validator: (value) {
+                    if (value == null || value.trim().isEmpty) return null;
+                    final amount = double.tryParse(value.trim());
+                    return amount == null ||
+                            !amount.isFinite ||
+                            amount < 0 ||
+                            amount > 1000000000000 ||
+                            !RegExp(r'^(?:\d+(?:\.\d{1,2})?|\.\d{1,2})$')
+                                .hasMatch(value.trim())
+                        ? 'Enter a valid non-negative budget.'
+                        : null;
+                  },
+                ),
               DropdownButtonFormField<String>(
                 initialValue: _customerId,
                 decoration: const InputDecoration(labelText: 'Linked client'),
@@ -8536,6 +11241,32 @@ class _ProjectEditorDialogState extends State<ProjectEditorDialog> {
                 },
               ),
               const SizedBox(height: 8),
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Start date'),
+                subtitle: Text(
+                  _startDate == null
+                      ? 'Not set'
+                      : MaterialLocalizations.of(context)
+                            .formatMediumDate(_startDate!),
+                ),
+                trailing: IconButton(
+                  tooltip: 'Choose start date',
+                  onPressed: () async {
+                    final date = await _pickDeliveryDate(context, _startDate);
+                    if (date != null && mounted) {
+                      setState(() => _startDate = date);
+                    }
+                  },
+                  icon: const Icon(Icons.calendar_today_outlined),
+                ),
+                onTap: () async {
+                  final date = await _pickDeliveryDate(context, _startDate);
+                  if (date != null && mounted) {
+                    setState(() => _startDate = date);
+                  }
+                },
+              ),
               ListTile(
                 contentPadding: EdgeInsets.zero,
                 title: const Text('Target date'),
@@ -8586,12 +11317,16 @@ class ProjectTaskEditorDialog extends StatefulWidget {
     super.key,
     required this.projects,
     required this.personas,
+    required this.tasks,
     required this.task,
+    this.loadProjectAssignees,
   });
 
   final List<StudioProject> projects;
   final List<StudioPersona> personas;
+  final List<StudioTaskRecord> tasks;
   final StudioTaskRecord task;
+  final Future<List<String>> Function(String projectId)? loadProjectAssignees;
 
   @override
   State<ProjectTaskEditorDialog> createState() =>
@@ -8605,11 +11340,21 @@ class _ProjectTaskEditorDialogState extends State<ProjectTaskEditorDialog> {
   late String _assignee;
   late String _priority;
   DateTime? _dueDate;
+  late Set<String> _dependencyIds;
+  List<String> _projectAssignees = const [];
+  String? _assigneeLoadError;
+  bool _isLoadingAssignees = false;
+  int _assigneeRequest = 0;
 
-  List<String> get _assignees => {
-    ...widget.personas.map((persona) => persona.name),
-    widget.task.assignee,
-  }.toList();
+  List<String> get _assignees {
+    final names = widget.loadProjectAssignees == null
+        ? widget.personas.map((persona) => persona.name)
+        : _projectAssignees;
+    return {
+      ...names.where((name) => name.isNotEmpty),
+      if (_assignee.isNotEmpty) _assignee,
+    }.toList();
+  }
 
   @override
   void initState() {
@@ -8619,6 +11364,41 @@ class _ProjectTaskEditorDialogState extends State<ProjectTaskEditorDialog> {
     _assignee = widget.task.assignee;
     _priority = widget.task.priority;
     _dueDate = widget.task.dueDate;
+    _dependencyIds = widget.task.dependsOnTaskIds.toSet();
+    if (widget.loadProjectAssignees != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _loadProjectAssignees(_projectId);
+      });
+    }
+  }
+
+  Future<void> _loadProjectAssignees(String projectId) async {
+    final loader = widget.loadProjectAssignees;
+    if (loader == null) return;
+    final request = ++_assigneeRequest;
+    setState(() {
+      _isLoadingAssignees = true;
+      _assigneeLoadError = null;
+    });
+    try {
+      final assignees = await loader(projectId);
+      if (!mounted || request != _assigneeRequest) return;
+      setState(() {
+        _projectAssignees = assignees;
+        if (_assignee.isNotEmpty && !_projectAssignees.contains(_assignee)) {
+          _assignee = '';
+        }
+      });
+    } catch (error) {
+      if (!mounted || request != _assigneeRequest) return;
+      setState(() {
+        _assigneeLoadError = 'Project members could not be loaded: $error';
+      });
+    } finally {
+      if (mounted && request == _assigneeRequest) {
+        setState(() => _isLoadingAssignees = false);
+      }
+    }
   }
 
   @override
@@ -8639,8 +11419,22 @@ class _ProjectTaskEditorDialogState extends State<ProjectTaskEditorDialog> {
         dueDate: _dueDate,
         isComplete: widget.task.isComplete,
         priority: _priority,
+        dependsOnTaskIds: _dependencyIds.toList(),
       ),
     );
+  }
+
+  bool _wouldCreateCycle(String dependencyId) {
+    final tasksById = {for (final task in widget.tasks) task.id: task};
+    final pending = <String>[dependencyId];
+    final visited = <String>{};
+    while (pending.isNotEmpty) {
+      final taskId = pending.removeLast();
+      if (taskId == widget.task.id) return true;
+      if (!visited.add(taskId)) continue;
+      pending.addAll(tasksById[taskId]?.dependsOnTaskIds ?? const []);
+    }
+    return false;
   }
 
   @override
@@ -8678,23 +11472,59 @@ class _ProjectTaskEditorDialogState extends State<ProjectTaskEditorDialog> {
                     )
                     .toList(),
                 onChanged: (value) {
-                  if (value != null) setState(() => _projectId = value);
+                  if (value != null) {
+                    setState(() {
+                      _projectId = value;
+                      _dependencyIds.clear();
+                      if (widget.loadProjectAssignees != null) {
+                        _assignee = '';
+                      }
+                    });
+                    _loadProjectAssignees(value);
+                  }
                 },
               ),
               const SizedBox(height: 10),
               DropdownButtonFormField<String>(
+                key: ValueKey('task-assignee-$_projectId-$_assignee'),
                 initialValue: _assignee,
                 decoration: const InputDecoration(labelText: 'Assigned to'),
-                items: _assignees
-                    .map(
-                      (name) =>
-                          DropdownMenuItem(value: name, child: Text(name)),
-                    )
-                    .toList(),
+                items: [
+                  const DropdownMenuItem(value: '', child: Text('Unassigned')),
+                  ..._assignees.map(
+                    (name) => DropdownMenuItem(value: name, child: Text(name)),
+                  ),
+                ],
                 onChanged: (value) {
                   if (value != null) setState(() => _assignee = value);
                 },
               ),
+              if (_isLoadingAssignees)
+                const LinearProgressIndicator(minHeight: 2),
+              if (_assigneeLoadError != null)
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(
+                      _assigneeLoadError!,
+                      style: const TextStyle(color: Colors.red, fontSize: 12),
+                    ),
+                  ),
+                )
+              else if (widget.loadProjectAssignees != null &&
+                  !_isLoadingAssignees &&
+                  _projectAssignees.isEmpty)
+                const Align(
+                  alignment: Alignment.centerLeft,
+                  child: Padding(
+                    padding: EdgeInsets.only(top: 6),
+                    child: Text(
+                      'No active members are assigned to this project.',
+                      style: TextStyle(color: muted, fontSize: 12),
+                    ),
+                  ),
+                ),
               const SizedBox(height: 10),
               DropdownButtonFormField<String>(
                 initialValue: _priority,
@@ -8711,6 +11541,59 @@ class _ProjectTaskEditorDialogState extends State<ProjectTaskEditorDialog> {
                   if (value != null) setState(() => _priority = value);
                 },
               ),
+              const SizedBox(height: 12),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: const Text(
+                  'Depends on',
+                  style: TextStyle(
+                    color: ink,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              if (widget.tasks
+                  .where(
+                    (task) =>
+                        task.projectId == _projectId &&
+                        task.id != widget.task.id,
+                  )
+                  .isEmpty)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 8),
+                  child: Text(
+                    'No other tasks in this project.',
+                    style: TextStyle(fontFamily: 'Arial', color: muted),
+                  ),
+                ),
+              ...widget.tasks
+                  .where(
+                    (task) =>
+                        task.projectId == _projectId &&
+                        task.id != widget.task.id,
+                  )
+                  .map((task) {
+                    final wouldCycle = _wouldCreateCycle(task.id);
+                    return CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      dense: true,
+                      title: Text(task.title),
+                      subtitle: wouldCycle
+                          ? const Text('Would create a dependency cycle')
+                          : null,
+                      value: _dependencyIds.contains(task.id),
+                      onChanged: wouldCycle
+                          ? null
+                          : (selected) => setState(() {
+                              if (selected == true) {
+                                _dependencyIds.add(task.id);
+                              } else {
+                                _dependencyIds.remove(task.id);
+                              }
+                            }),
+                    );
+                  }),
               ListTile(
                 contentPadding: EdgeInsets.zero,
                 title: const Text('Due date'),
@@ -8760,10 +11643,12 @@ class MilestoneEditorDialog extends StatefulWidget {
   const MilestoneEditorDialog({
     super.key,
     required this.projectId,
+    required this.phases,
     required this.milestone,
   });
 
   final String projectId;
+  final List<StudioProjectPhase> phases;
   final StudioMilestone milestone;
 
   @override
@@ -8775,6 +11660,7 @@ class _MilestoneEditorDialogState extends State<MilestoneEditorDialog> {
   late final TextEditingController _title;
   late final TextEditingController _update;
   late String _status;
+  String? _phaseId;
   DateTime? _dueDate;
 
   @override
@@ -8783,6 +11669,7 @@ class _MilestoneEditorDialogState extends State<MilestoneEditorDialog> {
     _title = TextEditingController(text: widget.milestone.title);
     _update = TextEditingController(text: widget.milestone.update);
     _status = widget.milestone.status;
+    _phaseId = widget.milestone.phaseId;
     _dueDate = widget.milestone.dueDate;
   }
 
@@ -8805,6 +11692,7 @@ class _MilestoneEditorDialogState extends State<MilestoneEditorDialog> {
         status: _status,
         update: _update.text.trim(),
         updatedAt: DateTime.now(),
+        phaseId: _phaseId,
       ),
     );
   }
@@ -8846,6 +11734,24 @@ class _MilestoneEditorDialogState extends State<MilestoneEditorDialog> {
                 onChanged: (value) {
                   if (value != null) setState(() => _status = value);
                 },
+              ),
+              const SizedBox(height: 8),
+              DropdownButtonFormField<String?>(
+                initialValue: _phaseId,
+                decoration: const InputDecoration(labelText: 'Project phase'),
+                items: [
+                  const DropdownMenuItem<String?>(
+                    value: null,
+                    child: Text('No phase'),
+                  ),
+                  ...widget.phases.map(
+                    (phase) => DropdownMenuItem<String?>(
+                      value: phase.id,
+                      child: Text(phase.name),
+                    ),
+                  ),
+                ],
+                onChanged: (value) => setState(() => _phaseId = value),
               ),
               TextField(
                 controller: _update,

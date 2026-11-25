@@ -1,5 +1,1365 @@
 part of 'main.dart';
 
+class QuotationEditorPage extends StatefulWidget {
+  const QuotationEditorPage({
+    super.key,
+    required this.quotation,
+    this.catalog = const [],
+  });
+
+  final StudioQuotation quotation;
+  final List<StudioLineItemCatalogEntry> catalog;
+
+  @override
+  State<QuotationEditorPage> createState() => _QuotationEditorPageState();
+}
+
+class _QuotationEditorPageState extends State<QuotationEditorPage>
+    with SingleTickerProviderStateMixin {
+  late final TabController _tabs;
+  late final TextEditingController _title;
+  late final TextEditingController _taxRate;
+  late final TextEditingController _catalogSearch;
+  late final List<_QuotationLineDraft> _lines;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabs = TabController(length: 3, vsync: this);
+    _title = TextEditingController(text: widget.quotation.title);
+    _catalogSearch = TextEditingController();
+    _taxRate = TextEditingController(
+      text: widget.quotation.taxRate.toStringAsFixed(2),
+    );
+    _lines = widget.quotation.items.map(_QuotationLineDraft.fromLine).toList();
+  }
+
+  @override
+  void dispose() {
+    _tabs.dispose();
+    _title.dispose();
+    _taxRate.dispose();
+    _catalogSearch.dispose();
+    for (final line in _lines) {
+      line.dispose();
+    }
+    super.dispose();
+  }
+
+  double get _subtotal =>
+      _lines.fold<double>(0, (total, line) => total + line.amount);
+
+  double get _parsedTaxRate => double.tryParse(_taxRate.text.trim()) ?? 0;
+
+  double get _total =>
+      (_subtotal * (1 + _parsedTaxRate / 100) * 100).round() / 100;
+
+  void _lineChanged(String _) {
+    setState(() => _error = null);
+  }
+
+  void _addLine() {
+    setState(() {
+      _error = null;
+      _lines.add(
+        _QuotationLineDraft.empty(
+          'quote-line-${DateTime.now().microsecondsSinceEpoch}',
+        ),
+      );
+    });
+  }
+
+  void _addCatalogItem(StudioLineItemCatalogEntry? entry) {
+    if (entry == null) {
+      setState(
+        () => _error = 'This starter item is not available in the catalog.',
+      );
+      return;
+    }
+    final rate = entry.rateForQuality('Basic');
+    if (rate == null) {
+      setState(
+        () => _error =
+            'Set a Basic rate for ${entry.name} in the workspace Line item catalog first.',
+      );
+      return;
+    }
+    setState(() {
+      _error = null;
+      _lines.add(
+        _QuotationLineDraft.fromCatalog(
+          entry,
+          'quote-line-${DateTime.now().microsecondsSinceEpoch}',
+        ),
+      );
+    });
+  }
+
+  void _removeLine(_QuotationLineDraft line) {
+    setState(() {
+      line.dispose();
+      _lines.remove(line);
+      _error = null;
+    });
+  }
+
+  void _save() {
+    if (_title.text.trim().isEmpty) {
+      setState(() {
+        _error = 'Enter a quotation title in the Details tab.';
+        _tabs.animateTo(0);
+      });
+      return;
+    }
+    final taxRate = double.tryParse(_taxRate.text.trim());
+    if (taxRate == null || !taxRate.isFinite || taxRate < 0 || taxRate > 100) {
+      setState(() {
+        _error = 'Enter a tax rate from 0 to 100 in the Review tab.';
+        _tabs.animateTo(2);
+      });
+      return;
+    }
+    if (_lines.isEmpty) {
+      setState(() {
+        _error = 'Add at least one line item before saving.';
+        _tabs.animateTo(1);
+      });
+      return;
+    }
+
+    final items = <StudioQuoteLine>[];
+    for (var index = 0; index < _lines.length; index++) {
+      final line = _lines[index];
+      final validationError = line.validationError;
+      if (validationError != null) {
+        setState(() {
+          _error = 'Line ${index + 1}: $validationError';
+          _tabs.animateTo(1);
+        });
+        return;
+      }
+      items.add(line.toQuoteLine());
+    }
+
+    Navigator.of(context).pop(
+      widget.quotation.copyWith(
+        title: _title.text.trim(),
+        items: items,
+        taxRate: taxRate,
+        updatedAt: DateTime.now(),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: canvas,
+    appBar: AppBar(
+      backgroundColor: paper,
+      foregroundColor: ink,
+      elevation: 0,
+      title: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            widget.quotation.items.isEmpty ? 'New quotation' : 'Edit quotation',
+            style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
+          ),
+          Text(
+            '${widget.quotation.number} · ${widget.quotation.projectName}',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontFamily: 'Arial',
+              color: muted,
+              fontSize: 10,
+            ),
+          ),
+        ],
+      ),
+      bottom: TabBar(
+        controller: _tabs,
+        isScrollable: true,
+        indicatorColor: accent,
+        labelColor: ink,
+        unselectedLabelColor: muted,
+        tabs: [
+          const Tab(text: 'Details'),
+          Tab(text: 'Line items (${_lines.length})'),
+          const Tab(text: 'Review & totals'),
+        ],
+      ),
+    ),
+    body: Column(
+      children: [
+        if (_error != null)
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.fromLTRB(18, 12, 18, 0),
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF9EAE6),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              _error!,
+              style: const TextStyle(
+                fontFamily: 'Arial',
+                color: Color(0xFF9C4B3D),
+                fontSize: 12,
+              ),
+            ),
+          ),
+        Expanded(
+          child: TabBarView(
+            controller: _tabs,
+            children: [_detailsTab(), _lineItemsTab(), _reviewTab()],
+          ),
+        ),
+      ],
+    ),
+    bottomNavigationBar: SafeArea(
+      top: false,
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(18, 10, 18, 10),
+        decoration: const BoxDecoration(
+          color: paper,
+          border: Border(top: BorderSide(color: line)),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'Estimated total',
+                    style: TextStyle(
+                      fontFamily: 'Arial',
+                      color: muted,
+                      fontSize: 10,
+                    ),
+                  ),
+                  Text(
+                    _formatCurrencyAmount(
+                      _total,
+                      widget.quotation.currencySymbol,
+                    ),
+                    style: const TextStyle(
+                      color: ink,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            const SizedBox(width: 8),
+            FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: ink),
+              onPressed: _save,
+              child: const Text('Save quotation'),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+
+  Widget _detailsTab() => ListView(
+    padding: const EdgeInsets.all(20),
+    children: [
+      const Text(
+        'Quotation details',
+        style: TextStyle(color: ink, fontSize: 18, fontWeight: FontWeight.w600),
+      ),
+      const SizedBox(height: 4),
+      const Text(
+        'Confirm the project and give this quotation a clear title.',
+        style: TextStyle(fontFamily: 'Arial', color: muted, fontSize: 12),
+      ),
+      const SizedBox(height: 18),
+      _infoCard(
+        children: [
+          _detailRow('Quotation number', widget.quotation.number),
+          _detailRow('Project', widget.quotation.projectName),
+          _detailRow('Client', widget.quotation.clientName),
+          if (widget.quotation.clientEmail.isNotEmpty)
+            _detailRow('Client email', widget.quotation.clientEmail),
+        ],
+      ),
+      const SizedBox(height: 16),
+      TextField(
+        controller: _title,
+        maxLength: 120,
+        onChanged: _lineChanged,
+        decoration: const InputDecoration(
+          labelText: 'Quotation title *',
+          hintText: 'For example, Kitchen cabinetry and installation',
+          border: OutlineInputBorder(),
+        ),
+      ),
+    ],
+  );
+
+  Widget _lineItemsTab() {
+    final activeCatalog = widget.catalog
+        .where((entry) => entry.active)
+        .toList(growable: false);
+    final query = _catalogSearch.text.trim().toLowerCase();
+    final searchResults = query.isEmpty
+        ? const <StudioLineItemCatalogEntry>[]
+        : activeCatalog
+              .where((entry) => entry.name.toLowerCase().contains(query))
+              .toList(growable: false);
+
+    return ListView(
+      padding: const EdgeInsets.all(20),
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Build the bill of quantities',
+                    style: TextStyle(
+                      color: ink,
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  SizedBox(height: 4),
+                  Text(
+                    'Search your workspace catalog or edit each line in the table. Dimensions are in millimeters.',
+                    style: TextStyle(
+                      fontFamily: 'Arial',
+                      color: muted,
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            FilledButton.icon(
+              onPressed: _addLine,
+              icon: const Icon(Icons.add, size: 17),
+              label: const Text('Add custom line'),
+              style: FilledButton.styleFrom(backgroundColor: ink),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        TextField(
+          controller: _catalogSearch,
+          onChanged: (_) => setState(() => _error = null),
+          decoration: InputDecoration(
+            labelText: 'Search workspace line items',
+            hintText: 'Try wardrobe, kitchen cabinet, or TV unit',
+            prefixIcon: const Icon(Icons.search),
+            suffixIcon: _catalogSearch.text.isEmpty
+                ? null
+                : IconButton(
+                    tooltip: 'Clear search',
+                    onPressed: () {
+                      _catalogSearch.clear();
+                      setState(() {});
+                    },
+                    icon: const Icon(Icons.close),
+                  ),
+            border: const OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Text(
+          'Quick add · common items',
+          style: const TextStyle(
+            color: ink,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 8,
+          runSpacing: 4,
+          children: [
+            for (final starter in StudioLineItemCatalogEntry.starterItems)
+              ActionChip(
+                avatar: const Icon(Icons.add, size: 15),
+                label: Text(starter.name),
+                onPressed: () {
+                  final entry = _catalogEntryById(starter.id);
+                  _addCatalogItem(entry?.active == true ? entry : null);
+                },
+              ),
+          ],
+        ),
+        if (query.isNotEmpty) ...[
+          const SizedBox(height: 14),
+          if (searchResults.isEmpty)
+            const Text(
+              'No active catalog items match that search.',
+              style: TextStyle(fontFamily: 'Arial', color: muted, fontSize: 12),
+            )
+          else
+            _infoCard(
+              children: [
+                for (final entry in searchResults)
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(entry.name),
+                    subtitle: Text(_catalogRateSummary(entry)),
+                    trailing: IconButton(
+                      tooltip: 'Add ${entry.name} at the Basic rate',
+                      onPressed: () => _addCatalogItem(entry),
+                      icon: const Icon(Icons.add_circle_outline),
+                    ),
+                  ),
+              ],
+            ),
+        ],
+        const SizedBox(height: 16),
+        _infoCard(
+          children: [
+            if (_lines.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 22),
+                child: Center(
+                  child: Text(
+                    'No line items yet. Search the catalog or add a custom line.',
+                    style: TextStyle(
+                      fontFamily: 'Arial',
+                      color: muted,
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
+              )
+            else
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: DataTable(
+                  horizontalMargin: 8,
+                  columnSpacing: 12,
+                  headingRowHeight: 42,
+                  dataRowMinHeight: 66,
+                  dataRowMaxHeight: 76,
+                  columns: const [
+                    DataColumn(label: Text('Description')),
+                    DataColumn(label: Text('Quality')),
+                    DataColumn(label: Text('Length (mm)')),
+                    DataColumn(label: Text('Width (mm)')),
+                    DataColumn(label: Text('Area (sq ft)')),
+                    DataColumn(label: Text('Qty')),
+                    DataColumn(label: Text('Rate')),
+                    DataColumn(label: Text('Amount')),
+                    DataColumn(label: Text('')),
+                  ],
+                  rows: [
+                    for (final line in _lines)
+                      DataRow(
+                        key: ValueKey(line.id),
+                        cells: [
+                          DataCell(
+                            _lineField(
+                              line.description,
+                              'Item description',
+                              width: 180,
+                              maxLength: 160,
+                            ),
+                          ),
+                          DataCell(
+                            SizedBox(
+                              width: 118,
+                              child: DropdownButtonFormField<String>(
+                                initialValue: line.packageName,
+                                isExpanded: true,
+                                decoration: _cellDecoration('Quality'),
+                                items: const ['Basic', 'Medium', 'Luxury'].map((
+                                  quality,
+                                ) {
+                                  final entry = _catalogEntryById(
+                                    line.catalogItemId,
+                                  );
+                                  final configured =
+                                      line.catalogItemId == null ||
+                                      entry?.rateForQuality(quality) != null;
+                                  return DropdownMenuItem(
+                                    value: quality,
+                                    enabled: configured,
+                                    child: Text(
+                                      quality,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  );
+                                }).toList(),
+                                onChanged: (quality) {
+                                  if (quality == null) return;
+                                  final entry = _catalogEntryById(
+                                    line.catalogItemId,
+                                  );
+                                  final rate = entry?.rateForQuality(quality);
+                                  if (line.catalogItemId != null &&
+                                      rate == null) {
+                                    setState(
+                                      () => _error =
+                                          '$quality pricing is not configured for ${entry?.name ?? 'this item'}.',
+                                    );
+                                    return;
+                                  }
+                                  setState(() {
+                                    line.packageName = quality;
+                                    if (rate != null) {
+                                      line.unitRate.text = rate.toString();
+                                    }
+                                    _error = null;
+                                  });
+                                },
+                              ),
+                            ),
+                          ),
+                          DataCell(
+                            _lineField(
+                              line.lengthMm,
+                              'mm',
+                              width: 84,
+                              numeric: true,
+                            ),
+                          ),
+                          DataCell(
+                            _lineField(
+                              line.widthMm,
+                              'mm',
+                              width: 84,
+                              numeric: true,
+                            ),
+                          ),
+                          DataCell(
+                            SizedBox(
+                              width: 86,
+                              child: Text(
+                                line.pricingBasis == 'area_sqft'
+                                    ? line.areaSquareFeet.toStringAsFixed(2)
+                                    : '—',
+                                textAlign: TextAlign.right,
+                              ),
+                            ),
+                          ),
+                          DataCell(
+                            _lineField(
+                              line.quantity,
+                              'Qty',
+                              width: 76,
+                              numeric: true,
+                            ),
+                          ),
+                          DataCell(
+                            _lineField(
+                              line.unitRate,
+                              line.pricingBasis == 'area_sqft'
+                                  ? '${widget.quotation.currencySymbol}/sq ft'
+                                  : 'Rate',
+                              width: 112,
+                              numeric: true,
+                            ),
+                          ),
+                          DataCell(
+                            SizedBox(
+                              width: 105,
+                              child: Text(
+                                _formatCurrencyAmount(
+                                  line.amount,
+                                  widget.quotation.currencySymbol,
+                                ),
+                                textAlign: TextAlign.right,
+                                style: const TextStyle(
+                                  color: ink,
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ),
+                          ),
+                          DataCell(
+                            IconButton(
+                              tooltip: 'Remove line item',
+                              onPressed: () => _removeLine(line),
+                              icon: const Icon(
+                                Icons.remove_circle_outline,
+                                color: Color(0xFF9C4B3D),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                  ],
+                ),
+              ),
+            const Divider(height: 24),
+            Align(
+              alignment: Alignment.centerRight,
+              child: Text(
+                'Subtotal  ${_formatCurrencyAmount(_subtotal, widget.quotation.currencySymbol)}',
+                style: const TextStyle(
+                  color: ink,
+                  fontWeight: FontWeight.w600,
+                  fontSize: 13,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  StudioLineItemCatalogEntry? _catalogEntryById(String? id) {
+    if (id == null) return null;
+    for (final entry in widget.catalog) {
+      if (entry.id == id) return entry;
+    }
+    return null;
+  }
+
+  String _catalogRateSummary(StudioLineItemCatalogEntry entry) {
+    String rateLabel(String quality, double? rate) => rate == null
+        ? '$quality: not configured'
+        : '$quality: ${_formatCurrencyAmount(rate, widget.quotation.currencySymbol)}/sq ft';
+    return [
+      rateLabel('Basic', entry.basicRatePerSqft),
+      rateLabel('Medium', entry.mediumRatePerSqft),
+      rateLabel('Luxury', entry.luxuryRatePerSqft),
+    ].join(' · ');
+  }
+
+  Widget _reviewTab() => ListView(
+    padding: const EdgeInsets.all(20),
+    children: [
+      const Text(
+        'Review quotation',
+        style: TextStyle(color: ink, fontSize: 18, fontWeight: FontWeight.w600),
+      ),
+      const SizedBox(height: 4),
+      const Text(
+        'Check the totals before saving. You can return to Line items to make changes.',
+        style: TextStyle(fontFamily: 'Arial', color: muted, fontSize: 12),
+      ),
+      const SizedBox(height: 18),
+      _infoCard(
+        children: [
+          _detailRow('Quotation', widget.quotation.number),
+          _detailRow(
+            'Title',
+            _title.text.trim().isEmpty ? 'Untitled' : _title.text,
+          ),
+          _detailRow('Project', widget.quotation.projectName),
+          _detailRow('Client', widget.quotation.clientName),
+          _detailRow('Line items', '${_lines.length}'),
+        ],
+      ),
+      const SizedBox(height: 16),
+      _infoCard(
+        children: [
+          TextField(
+            controller: _taxRate,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            onChanged: _lineChanged,
+            decoration: const InputDecoration(
+              labelText: 'Tax rate',
+              suffixText: '%',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 18),
+          _totalRow(
+            'Subtotal',
+            _formatCurrencyAmount(_subtotal, widget.quotation.currencySymbol),
+          ),
+          const SizedBox(height: 8),
+          _totalRow(
+            'Tax (${_taxRate.text.isEmpty ? '0' : _taxRate.text}%)',
+            _formatCurrencyAmount(
+              _subtotal * _parsedTaxRate / 100,
+              widget.quotation.currencySymbol,
+            ),
+          ),
+          const Divider(height: 24),
+          _totalRow(
+            'Total',
+            _formatCurrencyAmount(_total, widget.quotation.currencySymbol),
+            emphasize: true,
+          ),
+        ],
+      ),
+    ],
+  );
+
+  Widget _lineField(
+    TextEditingController controller,
+    String hint, {
+    required double width,
+    bool numeric = false,
+    int? maxLength,
+  }) => SizedBox(
+    width: width,
+    child: TextField(
+      controller: controller,
+      maxLength: maxLength,
+      onChanged: _lineChanged,
+      keyboardType: numeric
+          ? const TextInputType.numberWithOptions(decimal: true)
+          : TextInputType.text,
+      decoration: _cellDecoration(hint),
+    ),
+  );
+
+  InputDecoration _cellDecoration(String hint) => InputDecoration(
+    hintText: hint,
+    isDense: true,
+    contentPadding: const EdgeInsets.symmetric(horizontal: 9, vertical: 11),
+    border: OutlineInputBorder(
+      borderRadius: BorderRadius.circular(6),
+      borderSide: const BorderSide(color: line),
+    ),
+  );
+
+  Widget _infoCard({required List<Widget> children}) => Container(
+    padding: const EdgeInsets.all(16),
+    decoration: BoxDecoration(
+      color: paper,
+      borderRadius: BorderRadius.circular(10),
+      border: Border.all(color: line),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: children,
+    ),
+  );
+
+  Widget _detailRow(String label, String value) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 5),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 132,
+          child: Text(
+            label,
+            style: const TextStyle(
+              fontFamily: 'Arial',
+              color: muted,
+              fontSize: 12,
+            ),
+          ),
+        ),
+        Expanded(
+          child: Text(
+            value,
+            style: const TextStyle(
+              color: ink,
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+
+  Widget _totalRow(String label, String value, {bool emphasize = false}) => Row(
+    children: [
+      Expanded(
+        child: Text(
+          label,
+          style: TextStyle(
+            fontFamily: 'Arial',
+            color: emphasize ? ink : muted,
+            fontSize: emphasize ? 14 : 12,
+            fontWeight: emphasize ? FontWeight.w700 : FontWeight.w400,
+          ),
+        ),
+      ),
+      Text(
+        value,
+        style: TextStyle(
+          color: ink,
+          fontSize: emphasize ? 18 : 13,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    ],
+  );
+}
+
+class _QuotationLineDraft {
+  _QuotationLineDraft.empty(this.id)
+    : description = TextEditingController(),
+      lengthMm = TextEditingController(),
+      heightMm = TextEditingController(),
+      widthMm = TextEditingController(),
+      quantity = TextEditingController(text: '1'),
+      unit = TextEditingController(text: 'sq ft'),
+      unitRate = TextEditingController(text: '0'),
+      packageName = 'Basic',
+      catalogItemId = null,
+      pricingBasis = 'area_sqft';
+
+  _QuotationLineDraft.fromCatalog(StudioLineItemCatalogEntry entry, this.id)
+    : description = TextEditingController(text: entry.name),
+      lengthMm = TextEditingController(),
+      heightMm = TextEditingController(),
+      widthMm = TextEditingController(),
+      quantity = TextEditingController(text: '1'),
+      unit = TextEditingController(text: 'sq ft'),
+      unitRate = TextEditingController(
+        text: entry.basicRatePerSqft!.toString(),
+      ),
+      packageName = 'Basic',
+      catalogItemId = entry.id,
+      pricingBasis = 'area_sqft';
+
+  _QuotationLineDraft.fromLine(StudioQuoteLine line)
+    : id = line.id,
+      description = TextEditingController(text: line.description),
+      lengthMm = TextEditingController(text: line.lengthMm?.toString() ?? ''),
+      heightMm = TextEditingController(text: line.heightMm?.toString() ?? ''),
+      widthMm = TextEditingController(text: line.widthMm?.toString() ?? ''),
+      quantity = TextEditingController(text: line.quantity.toString()),
+      unit = TextEditingController(text: line.unit),
+      unitRate = TextEditingController(text: line.unitRate.toString()),
+      packageName = line.packageName ?? 'Basic',
+      catalogItemId = line.catalogItemId,
+      pricingBasis = line.pricingBasis;
+
+  final String id;
+  final TextEditingController description;
+  final TextEditingController lengthMm;
+  final TextEditingController heightMm;
+  final TextEditingController widthMm;
+  final TextEditingController quantity;
+  final TextEditingController unit;
+  final TextEditingController unitRate;
+  String packageName;
+  final String? catalogItemId;
+  final String pricingBasis;
+
+  double get areaSquareFeet {
+    final lengthValue = double.tryParse(lengthMm.text.trim());
+    final widthValue = double.tryParse(widthMm.text.trim());
+    if (lengthValue == null ||
+        widthValue == null ||
+        !lengthValue.isFinite ||
+        !widthValue.isFinite) {
+      return 0;
+    }
+    return lengthValue * widthValue / 92903.04;
+  }
+
+  double get amount {
+    final quantityValue = double.tryParse(quantity.text.trim());
+    final rateValue = double.tryParse(unitRate.text.trim());
+    if (quantityValue == null ||
+        rateValue == null ||
+        !quantityValue.isFinite ||
+        !rateValue.isFinite) {
+      return 0;
+    }
+    final billableQuantity = pricingBasis == 'area_sqft'
+        ? quantityValue * areaSquareFeet
+        : quantityValue;
+    return (billableQuantity * rateValue * 100).round() / 100;
+  }
+
+  String? get validationError {
+    if (description.text.trim().isEmpty) return 'enter a description.';
+    final quantityValue = double.tryParse(quantity.text.trim());
+    if (quantityValue == null ||
+        !quantityValue.isFinite ||
+        quantityValue <= 0) {
+      return 'enter a quantity above zero.';
+    }
+    if (unit.text.trim().isEmpty) return 'enter a unit.';
+    final rateValue = double.tryParse(unitRate.text.trim());
+    if (rateValue == null || !rateValue.isFinite || rateValue < 0) {
+      return 'enter a non-negative rate.';
+    }
+    if (pricingBasis == 'area_sqft' &&
+        (lengthMm.text.trim().isEmpty || widthMm.text.trim().isEmpty)) {
+      return 'enter both length and width for square-foot pricing.';
+    }
+    for (final dimension in [
+      ('length', lengthMm),
+      ('height', heightMm),
+      ('width', widthMm),
+    ]) {
+      final value = dimension.$2.text.trim();
+      if (value.isEmpty) continue;
+      final parsed = double.tryParse(value);
+      if (parsed == null || !parsed.isFinite || parsed <= 0) {
+        return 'enter a positive ${dimension.$1} or leave it blank.';
+      }
+    }
+    return null;
+  }
+
+  StudioQuoteLine toQuoteLine() => StudioQuoteLine(
+    id: id,
+    description: description.text.trim(),
+    quantity: double.parse(quantity.text.trim()),
+    unit: unit.text.trim(),
+    unitRate: double.parse(unitRate.text.trim()),
+    packageName: packageName,
+    catalogItemId: catalogItemId,
+    pricingBasis: pricingBasis,
+    lengthMm: _optionalDimension(lengthMm),
+    heightMm: _optionalDimension(heightMm),
+    widthMm: _optionalDimension(widthMm),
+  );
+
+  double? _optionalDimension(TextEditingController controller) {
+    final value = controller.text.trim();
+    return value.isEmpty ? null : double.parse(value);
+  }
+
+  void dispose() {
+    description.dispose();
+    lengthMm.dispose();
+    heightMm.dispose();
+    widthMm.dispose();
+    quantity.dispose();
+    unit.dispose();
+    unitRate.dispose();
+  }
+}
+
+class LineItemCatalogPanel extends StatefulWidget {
+  const LineItemCatalogPanel({
+    super.key,
+    required this.catalog,
+    required this.currencySymbol,
+    required this.canManage,
+    required this.loading,
+    required this.error,
+    required this.onSave,
+  });
+
+  final List<StudioLineItemCatalogEntry> catalog;
+  final String currencySymbol;
+  final bool canManage;
+  final bool loading;
+  final String? error;
+  final Future<bool> Function(StudioLineItemCatalogEntry entry) onSave;
+
+  @override
+  State<LineItemCatalogPanel> createState() => _LineItemCatalogPanelState();
+}
+
+class _LineItemCatalogPanelState extends State<LineItemCatalogPanel> {
+  final _name = TextEditingController();
+  final _basicRate = TextEditingController();
+  final _mediumRate = TextEditingController();
+  final _luxuryRate = TextEditingController();
+  String? _formError;
+  bool _adding = false;
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _basicRate.dispose();
+    _mediumRate.dispose();
+    _luxuryRate.dispose();
+    super.dispose();
+  }
+
+  Future<void> _addEntry() async {
+    final name = _name.text.trim();
+    if (name.isEmpty) {
+      setState(() => _formError = 'Enter a line item name.');
+      return;
+    }
+    final rates = _readRates(
+      _basicRate.text,
+      _mediumRate.text,
+      _luxuryRate.text,
+    );
+    if (rates == null) return;
+    setState(() {
+      _adding = true;
+      _formError = null;
+    });
+    final entry = StudioLineItemCatalogEntry(
+      id: 'line-item-${DateTime.now().microsecondsSinceEpoch}',
+      name: name,
+      basicRatePerSqft: rates.$1,
+      mediumRatePerSqft: rates.$2,
+      luxuryRatePerSqft: rates.$3,
+    );
+    final saved = await widget.onSave(entry);
+    if (!mounted) return;
+    setState(() => _adding = false);
+    if (!saved) return;
+    _name.clear();
+    _basicRate.clear();
+    _mediumRate.clear();
+    _luxuryRate.clear();
+  }
+
+  (double?, double?, double?)? _readRates(
+    String basicText,
+    String mediumText,
+    String luxuryText,
+  ) {
+    final values = <double?>[];
+    for (final (label, text) in [
+      ('Basic', basicText),
+      ('Medium', mediumText),
+      ('Luxury', luxuryText),
+    ]) {
+      if (text.trim().isEmpty) {
+        values.add(null);
+        continue;
+      }
+      final rate = double.tryParse(text.trim());
+      if (rate == null || !rate.isFinite || rate < 0) {
+        setState(() => _formError = 'Enter a non-negative $label rate.');
+        return null;
+      }
+      values.add(rate);
+    }
+    return (values[0], values[1], values[2]);
+  }
+
+  @override
+  Widget build(BuildContext context) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      const Text(
+        'Each rate is for one square foot. Starter names are unpriced until you configure them.',
+        style: TextStyle(fontFamily: 'Arial', color: muted, fontSize: 11),
+      ),
+      if (widget.canManage) ...[
+        const SizedBox(height: 12),
+        Wrap(
+          spacing: 10,
+          runSpacing: 10,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            SizedBox(
+              width: 220,
+              child: TextField(
+                controller: _name,
+                maxLength: 120,
+                decoration: const InputDecoration(
+                  labelText: 'New line item name',
+                  counterText: '',
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+              ),
+            ),
+            _rateField(_basicRate, 'Basic'),
+            _rateField(_mediumRate, 'Medium'),
+            _rateField(_luxuryRate, 'Luxury'),
+            FilledButton.icon(
+              onPressed: widget.loading || _adding ? null : _addEntry,
+              icon: const Icon(Icons.add, size: 16),
+              label: const Text('Add item'),
+              style: FilledButton.styleFrom(backgroundColor: ink),
+            ),
+          ],
+        ),
+        if (_formError != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text(
+              _formError!,
+              style: const TextStyle(
+                fontFamily: 'Arial',
+                color: Color(0xFF9C4B3D),
+                fontSize: 11,
+              ),
+            ),
+          ),
+      ],
+      if (widget.loading) ...[
+        const SizedBox(height: 12),
+        const LinearProgressIndicator(),
+      ],
+      if (widget.error != null) ...[
+        const SizedBox(height: 12),
+        Text(
+          widget.error!,
+          style: const TextStyle(
+            fontFamily: 'Arial',
+            color: Color(0xFF9C4B3D),
+            fontSize: 11,
+          ),
+        ),
+      ],
+      const SizedBox(height: 12),
+      if (widget.catalog.isEmpty && !widget.loading)
+        const Text(
+          'No line items are available.',
+          style: TextStyle(fontFamily: 'Arial', color: muted, fontSize: 12),
+        )
+      else
+        for (final entry in widget.catalog)
+          _LineItemCatalogEntryRow(
+            key: ValueKey(entry.id),
+            entry: entry,
+            currencySymbol: widget.currencySymbol,
+            canManage: widget.canManage,
+            saving: widget.loading,
+            onSave: widget.onSave,
+          ),
+    ],
+  );
+
+  Widget _rateField(TextEditingController controller, String quality) =>
+      SizedBox(
+        width: 135,
+        child: TextField(
+          controller: controller,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: InputDecoration(
+            labelText: '$quality ${widget.currencySymbol}/sq ft',
+            border: const OutlineInputBorder(),
+            isDense: true,
+          ),
+        ),
+      );
+}
+
+class _LineItemCatalogEntryRow extends StatefulWidget {
+  const _LineItemCatalogEntryRow({
+    super.key,
+    required this.entry,
+    required this.currencySymbol,
+    required this.canManage,
+    required this.saving,
+    required this.onSave,
+  });
+
+  final StudioLineItemCatalogEntry entry;
+  final String currencySymbol;
+  final bool canManage;
+  final bool saving;
+  final Future<bool> Function(StudioLineItemCatalogEntry entry) onSave;
+
+  @override
+  State<_LineItemCatalogEntryRow> createState() =>
+      _LineItemCatalogEntryRowState();
+}
+
+class _LineItemCatalogEntryRowState extends State<_LineItemCatalogEntryRow> {
+  late final TextEditingController _name;
+  late final TextEditingController _basicRate;
+  late final TextEditingController _mediumRate;
+  late final TextEditingController _luxuryRate;
+  String? _error;
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _name = TextEditingController(text: widget.entry.name);
+    _basicRate = TextEditingController(
+      text: widget.entry.basicRatePerSqft?.toString() ?? '',
+    );
+    _mediumRate = TextEditingController(
+      text: widget.entry.mediumRatePerSqft?.toString() ?? '',
+    );
+    _luxuryRate = TextEditingController(
+      text: widget.entry.luxuryRatePerSqft?.toString() ?? '',
+    );
+  }
+
+  @override
+  void didUpdateWidget(covariant _LineItemCatalogEntryRow oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.entry.version != widget.entry.version) {
+      _name.text = widget.entry.name;
+      _basicRate.text = widget.entry.basicRatePerSqft?.toString() ?? '';
+      _mediumRate.text = widget.entry.mediumRatePerSqft?.toString() ?? '';
+      _luxuryRate.text = widget.entry.luxuryRatePerSqft?.toString() ?? '';
+    }
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _basicRate.dispose();
+    _mediumRate.dispose();
+    _luxuryRate.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save({bool? active}) async {
+    if (_name.text.trim().isEmpty) {
+      setState(() => _error = 'Enter a line item name.');
+      return;
+    }
+    final rates = _parseRates();
+    if (rates == null) return;
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+    final entry = StudioLineItemCatalogEntry(
+      id: widget.entry.id,
+      name: _name.text.trim(),
+      basicRatePerSqft: rates.$1,
+      mediumRatePerSqft: rates.$2,
+      luxuryRatePerSqft: rates.$3,
+      active: active ?? widget.entry.active,
+      version: widget.entry.version + 1,
+    );
+    final saved = await widget.onSave(entry);
+    if (!mounted) return;
+    setState(() {
+      _saving = false;
+      if (!saved) _error = 'The catalog entry could not be saved.';
+    });
+  }
+
+  (double?, double?, double?)? _parseRates() {
+    final values = <double?>[];
+    for (final (label, text) in [
+      ('Basic', _basicRate.text),
+      ('Medium', _mediumRate.text),
+      ('Luxury', _luxuryRate.text),
+    ]) {
+      if (text.trim().isEmpty) {
+        values.add(null);
+        continue;
+      }
+      final rate = double.tryParse(text.trim());
+      if (rate == null || !rate.isFinite || rate < 0) {
+        setState(() => _error = 'Enter a non-negative $label rate.');
+        return null;
+      }
+      values.add(rate);
+    }
+    return (values[0], values[1], values[2]);
+  }
+
+  @override
+  Widget build(BuildContext context) => Container(
+    margin: const EdgeInsets.only(bottom: 8),
+    padding: const EdgeInsets.all(10),
+    decoration: BoxDecoration(
+      color: widget.entry.active ? paper : const Color(0xFFF4F2EF),
+      borderRadius: BorderRadius.circular(8),
+      border: Border.all(color: line),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            SizedBox(
+              width: 210,
+              child: _field(
+                _name,
+                'Line item name',
+                readOnly: !widget.canManage,
+              ),
+            ),
+            _field(
+              _basicRate,
+              'Basic ${widget.currencySymbol}/sq ft',
+              readOnly: !widget.canManage,
+              numeric: true,
+            ),
+            _field(
+              _mediumRate,
+              'Medium ${widget.currencySymbol}/sq ft',
+              readOnly: !widget.canManage,
+              numeric: true,
+            ),
+            _field(
+              _luxuryRate,
+              'Luxury ${widget.currencySymbol}/sq ft',
+              readOnly: !widget.canManage,
+              numeric: true,
+            ),
+            Chip(
+              label: Text(widget.entry.active ? 'Active' : 'Archived'),
+              visualDensity: VisualDensity.compact,
+            ),
+            if (widget.canManage) ...[
+              IconButton(
+                tooltip: 'Save ${widget.entry.name}',
+                onPressed: widget.saving || _saving ? null : () => _save(),
+                icon: const Icon(Icons.save_outlined),
+              ),
+              IconButton(
+                tooltip: widget.entry.active
+                    ? 'Archive ${widget.entry.name}'
+                    : 'Restore ${widget.entry.name}',
+                onPressed: widget.saving || _saving
+                    ? null
+                    : () => _save(active: !widget.entry.active),
+                icon: Icon(
+                  widget.entry.active
+                      ? Icons.archive_outlined
+                      : Icons.unarchive_outlined,
+                ),
+              ),
+            ],
+          ],
+        ),
+        if (_error != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(
+              _error!,
+              style: const TextStyle(
+                fontFamily: 'Arial',
+                color: Color(0xFF9C4B3D),
+                fontSize: 11,
+              ),
+            ),
+          ),
+      ],
+    ),
+  );
+
+  Widget _field(
+    TextEditingController controller,
+    String label, {
+    bool readOnly = false,
+    bool numeric = false,
+  }) => SizedBox(
+    width: 150,
+    child: TextField(
+      controller: controller,
+      readOnly: readOnly,
+      keyboardType: numeric
+          ? const TextInputType.numberWithOptions(decimal: true)
+          : TextInputType.text,
+      decoration: InputDecoration(
+        labelText: label,
+        border: const OutlineInputBorder(),
+        isDense: true,
+      ),
+    ),
+  );
+}
+
 class QuotationEditorDialog extends StatefulWidget {
   const QuotationEditorDialog({super.key, required this.quotation});
 
@@ -137,7 +1497,7 @@ class _QuotationEditorDialogState extends State<QuotationEditorDialog> {
                                 fontSize: 11,
                                 fontWeight: FontWeight.w600)),
                         subtitle: Text(
-                            '${item.quantity} ${item.unit} × ${_formatCurrencyAmount(item.unitRate, widget.quotation.currencySymbol)}',
+                            '${item.packageName == null ? '' : '${item.packageName} · '}${item.lengthMm == null ? '' : '${item.lengthMm!.toStringAsFixed(0)}L × '}${item.heightMm == null ? '' : '${item.heightMm!.toStringAsFixed(0)}H × '}${item.quantity} ${item.unit} × ${_formatCurrencyAmount(item.unitRate, widget.quotation.currencySymbol)}',
                             style: const TextStyle(
                                 fontFamily: 'Arial',
                                 color: muted,
@@ -226,6 +1586,10 @@ class _QuoteLineEditorDialogState extends State<QuoteLineEditorDialog> {
   late final TextEditingController _quantity;
   late final TextEditingController _unit;
   late final TextEditingController _unitRate;
+  late final TextEditingController _lengthMm;
+  late final TextEditingController _heightMm;
+  late final TextEditingController _widthMm;
+  String _packageName = 'Basic';
 
   @override
   void initState() {
@@ -234,6 +1598,16 @@ class _QuoteLineEditorDialogState extends State<QuoteLineEditorDialog> {
     _quantity = TextEditingController(text: widget.line.quantity.toString());
     _unit = TextEditingController(text: widget.line.unit);
     _unitRate = TextEditingController(text: widget.line.unitRate.toString());
+    _lengthMm = TextEditingController(
+      text: widget.line.lengthMm?.toStringAsFixed(0) ?? '',
+    );
+    _heightMm = TextEditingController(
+      text: widget.line.heightMm?.toStringAsFixed(0) ?? '',
+    );
+    _widthMm = TextEditingController(
+      text: widget.line.widthMm?.toStringAsFixed(0) ?? '',
+    );
+    _packageName = widget.line.packageName ?? 'Basic';
   }
 
   @override
@@ -242,11 +1616,19 @@ class _QuoteLineEditorDialogState extends State<QuoteLineEditorDialog> {
     _quantity.dispose();
     _unit.dispose();
     _unitRate.dispose();
+    _lengthMm.dispose();
+    _heightMm.dispose();
+    _widthMm.dispose();
     super.dispose();
   }
 
   void _save() {
     if (!_formKey.currentState!.validate()) return;
+    double? optionalDimension(TextEditingController controller) {
+      final text = controller.text.trim();
+      if (text.isEmpty) return null;
+      return double.tryParse(text);
+    }
     Navigator.pop(
       context,
       StudioQuoteLine(
@@ -255,6 +1637,10 @@ class _QuoteLineEditorDialogState extends State<QuoteLineEditorDialog> {
         quantity: double.parse(_quantity.text.trim()),
         unit: _unit.text.trim(),
         unitRate: double.parse(_unitRate.text.trim()),
+        packageName: _packageName,
+        lengthMm: optionalDimension(_lengthMm),
+        heightMm: optionalDimension(_heightMm),
+        widthMm: optionalDimension(_widthMm),
       ),
     );
   }
@@ -279,6 +1665,56 @@ class _QuoteLineEditorDialogState extends State<QuoteLineEditorDialog> {
                       value == null || value.trim().isEmpty
                           ? 'Enter a description.'
                           : null,
+                ),
+                DropdownButtonFormField<String>(
+                  initialValue: _packageName,
+                  decoration:
+                      const InputDecoration(labelText: 'Hardware package'),
+                  items: const ['Basic', 'Medium', 'Luxury']
+                      .map(
+                        (packageName) => DropdownMenuItem(
+                          value: packageName,
+                          child: Text(packageName),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (value) {
+                    if (value != null) setState(() => _packageName = value);
+                  },
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextFormField(
+                        controller: _lengthMm,
+                        keyboardType:
+                            const TextInputType.numberWithOptions(decimal: true),
+                        decoration:
+                            const InputDecoration(labelText: 'Length (mm)'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: TextFormField(
+                        controller: _heightMm,
+                        keyboardType:
+                            const TextInputType.numberWithOptions(decimal: true),
+                        decoration:
+                            const InputDecoration(labelText: 'Height (mm)'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: TextFormField(
+                        controller: _widthMm,
+                        keyboardType:
+                            const TextInputType.numberWithOptions(decimal: true),
+                        decoration:
+                            const InputDecoration(labelText: 'Width (mm)'),
+                      ),
+                    ),
+                  ],
                 ),
                 Row(
                   children: [

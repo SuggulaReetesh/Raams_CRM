@@ -1,5 +1,10 @@
 const { authenticateRequest } = require('./_lib/auth');
-const { withUserTransaction } = require('./_lib/database');
+const {
+  requirePermission,
+  WorkspaceAccessError,
+  withWorkspaceTransaction,
+} = require('./_lib/database');
+const { getWorkspaceId } = require('./_lib/workspace_context');
 const {
   enforceUserRateLimit,
   respondToRateLimit,
@@ -77,7 +82,7 @@ function validateIntegration(provider, settings) {
 
 function createIntegrationsHandler({
   authenticate = authenticateRequest,
-  withTransaction = withUserTransaction,
+  withWorkspace = withWorkspaceTransaction,
   rateLimit = null,
   env = process.env,
   logger = console.error,
@@ -103,18 +108,22 @@ function createIntegrationsHandler({
           },
         );
       }
+      const workspaceId = getWorkspaceId(req);
       if (req.method === 'GET') {
-        const integrations = await withTransaction(userId, async (client) => {
+        const integrations = await withWorkspace(
+          userId,
+          workspaceId,
+          async (client, access) => {
+          requirePermission(access, 'viewCommunications');
           const result = await client.query(
             `SELECT provider, account_hint, updated_at
              FROM workspace_integrations
-             WHERE workspace_id IN (
-               SELECT id FROM workspaces WHERE owner_user_id = $1
-             )`,
-            [userId],
+             WHERE workspace_id = $1`,
+            [workspaceId],
           );
           return result.rows;
-        });
+          },
+        );
         return res.status(200).json({
           integrations: integrations.map((integration) => ({
             provider: integration.provider,
@@ -136,14 +145,12 @@ function createIntegrationsHandler({
       }
 
       if (req.method === 'DELETE') {
-        await withTransaction(userId, async (client) => {
+        await withWorkspace(userId, workspaceId, async (client, access) => {
+          requirePermission(access, 'manageCommunications');
           await client.query(
             `DELETE FROM workspace_integrations
-             WHERE provider = $1
-               AND workspace_id IN (
-                 SELECT id FROM workspaces WHERE owner_user_id = $2
-               )`,
-            [provider, userId],
+             WHERE workspace_id = $1 AND provider = $2`,
+            [workspaceId, provider],
           );
         });
         return res.status(200).json({ provider, configured: false });
@@ -159,20 +166,18 @@ function createIntegrationsHandler({
       const validated = validateIntegration(provider, req.body.settings);
       const encrypted = encryptSecrets(
         validated.secrets,
-        `${userId}:${provider}`,
+        `${workspaceId}:${provider}`,
         env,
       );
-      await withTransaction(userId, async (client) => {
-        await client.query(
-          `INSERT INTO workspaces (owner_user_id, name)
-           VALUES ($1, $2)
-           ON CONFLICT (owner_user_id) DO NOTHING`,
-          [userId, workspaceName?.trim() || 'Studio'],
-        );
+      await withWorkspace(userId, workspaceId, async (client, access) => {
+        requirePermission(access, 'manageCommunications');
         const workspace = await client.query(
-          'SELECT id FROM workspaces WHERE owner_user_id = $1',
-          [userId],
+          'SELECT owner_user_id FROM workspaces WHERE id = $1',
+          [workspaceId],
         );
+        if (workspace.rowCount !== 1) {
+          throw new WorkspaceAccessError(404, 'workspace_not_found');
+        }
         await client.query(
           `INSERT INTO workspace_integrations
              (workspace_id, owner_user_id, provider, account_id, account_hint,
@@ -186,8 +191,8 @@ function createIntegrationsHandler({
              secret_auth_tag = EXCLUDED.secret_auth_tag,
              updated_at = now()`,
           [
-            workspace.rows[0].id,
-            userId,
+            workspaceId,
+            workspace.rows[0].owner_user_id,
             provider,
             validated.accountId,
             validated.accountHint,
@@ -204,10 +209,13 @@ function createIntegrationsHandler({
       });
     } catch (error) {
       if (respondToRateLimit(error, res)) return;
-      if (error instanceof HttpError ||
+      if (error instanceof HttpError || error instanceof WorkspaceAccessError ||
           (Number.isInteger(error?.statusCode) && error.statusCode === 401)) {
         return res.status(error.statusCode).json({
-          error: error instanceof HttpError ? error.code : 'unauthorized',
+          error: error instanceof HttpError ||
+              error instanceof WorkspaceAccessError
+            ? error.code
+            : 'unauthorized',
         });
       }
       logger('Integration settings request failed.', {

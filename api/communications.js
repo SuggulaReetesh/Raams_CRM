@@ -1,6 +1,11 @@
 const nodemailer = require('nodemailer');
 const { authenticateRequest } = require('./_lib/auth');
-const { withUserTransaction } = require('./_lib/database');
+const {
+  requirePermission,
+  WorkspaceAccessError,
+  withWorkspaceTransaction,
+} = require('./_lib/database');
+const { getWorkspaceId } = require('./_lib/workspace_context');
 const { attachRequestId } = require('./_lib/request_id');
 const {
   enforceUserRateLimit,
@@ -27,6 +32,24 @@ function isRecord(value) {
 }
 
 function prepareMessage(value, snapshot) {
+  const procurementCollections = new Map([
+    ['requisition', snapshot.delivery.requisitions],
+    ['rfq', snapshot.delivery.rfqs],
+    ['quote', snapshot.delivery.vendorQuotes],
+    ['purchaseOrder', snapshot.delivery.purchaseOrders],
+  ]);
+  const relatedProcurementRecord =
+    value?.procurementRecordType == null ||
+        value?.procurementRecordId == null
+      ? null
+      : procurementCollections.get(value.procurementRecordType)?.find(
+          (record) => record.id === value.procurementRecordId,
+        );
+  const vendor = value?.vendorId == null
+    ? null
+    : snapshot.delivery.vendors.find(
+        (item) => item.id === value.vendorId,
+      );
   if (!isRecord(value) ||
       typeof value.id !== 'string' ||
       !validId.test(value.id) ||
@@ -40,6 +63,23 @@ function prepareMessage(value, snapshot) {
       /[\r\n]/.test(value.subject) ||
       typeof value.createdByPersonaId !== 'string' ||
       typeof value.createdByName !== 'string' ||
+      (value.vendorId != null && !vendor) ||
+      (value.procurementRecordId != null &&
+        (!relatedProcurementRecord ||
+          relatedProcurementRecord.projectId !== value.projectId)) ||
+      (value.procurementRecordType != null &&
+        value.procurementRecordId == null) ||
+      (value.procurementRecordId != null &&
+        value.procurementRecordType == null) ||
+      (value.procurementRecordType === 'rfq' &&
+        value.vendorId != null &&
+        !relatedProcurementRecord.vendorIds.includes(value.vendorId)) ||
+      (['quote', 'purchaseOrder'].includes(value.procurementRecordType) &&
+        value.vendorId != null &&
+        relatedProcurementRecord.vendorId !== value.vendorId) ||
+      (value.vendorId != null &&
+        value.procurementRecordId != null &&
+        value.procurementRecordType === 'requisition') ||
       value.createdByName.trim().length === 0 ||
       value.createdByName.length > 120 ||
       !Array.isArray(value.mentionedPersonaIds) ||
@@ -75,6 +115,9 @@ function prepareMessage(value, snapshot) {
     id: value.id,
     clientId: client?.id ?? null,
     clientName: client?.name ?? '',
+    vendorId: vendor?.id ?? null,
+    procurementRecordType: value.procurementRecordType ?? null,
+    procurementRecordId: relatedProcurementRecord?.id ?? null,
     projectId: project?.id ?? null,
     projectName: project?.name ?? '',
     channel: value.channel,
@@ -93,20 +136,20 @@ function prepareMessage(value, snapshot) {
   };
 }
 
-async function loadProviderSettings(client, userId, provider, env) {
+async function loadProviderSettings(client, workspaceId, provider, env) {
   const result = await client.query(
     `SELECT i.*
      FROM workspace_integrations i
      JOIN workspaces w ON w.id = i.workspace_id
-     WHERE w.owner_user_id = $1 AND i.provider = $2`,
-    [userId, provider],
+     WHERE w.id = $1 AND i.provider = $2`,
+    [workspaceId, provider],
   );
   if (result.rows.length === 0) {
     throw new HttpError(409, 'integration_not_configured');
   }
   return decryptSecrets(
     result.rows[0],
-    `${userId}:${provider}`,
+    `${workspaceId}:${provider}`,
     env,
   );
 }
@@ -196,7 +239,7 @@ async function deliverWhatsApp(settings, message, env) {
 
 function createCommunicationsHandler({
   authenticate = authenticateRequest,
-  withTransaction = withUserTransaction,
+  withWorkspace = withWorkspaceTransaction,
   loadWorkspaceFn = loadWorkspace,
   saveWorkspaceFn = saveWorkspace,
   rateLimit = null,
@@ -220,6 +263,7 @@ function createCommunicationsHandler({
           windowSeconds: 60,
         });
       }
+      const workspaceId = getWorkspaceId(req);
       if (!isRecord(req.body) ||
           Buffer.byteLength(JSON.stringify(req.body)) > maximumRequestBytes ||
           !Number.isSafeInteger(req.body.revision) ||
@@ -241,7 +285,11 @@ function createCommunicationsHandler({
       const provider = requestedMessage.channel === 'Email'
         ? 'postal'
         : 'whatsapp';
-      const initial = await withTransaction(userId, async (client) => {
+      const initial = await withWorkspace(
+        userId,
+        workspaceId,
+        async (client, access) => {
+        requirePermission(access, 'manageCommunications');
         const current = await loadWorkspaceFn(client, userId);
         if (!current.snapshot) throw new HttpError(404, 'workspace_not_found');
         const existing = current.snapshot.communications.find(
@@ -270,7 +318,7 @@ function createCommunicationsHandler({
         const message = prepareMessage(requestedMessage, current.snapshot);
         await loadProviderSettings(
           client,
-          userId,
+          workspaceId,
           provider,
           env,
         );
@@ -288,7 +336,8 @@ function createCommunicationsHandler({
           false,
         );
         return { communication: message, revision, shouldDeliver: true };
-      });
+        },
+      );
 
       if (!initial.shouldDeliver) {
         return res.status(200).json({
@@ -303,8 +352,11 @@ function createCommunicationsHandler({
       let providerMessageId = null;
       let deliveryFailed = false;
       try {
-        const settings = await withTransaction(userId, (client) =>
-          loadProviderSettings(client, userId, provider, env));
+        const settings = await withWorkspace(
+          userId,
+          workspaceId,
+          (client) => loadProviderSettings(client, workspaceId, provider, env),
+        );
         providerMessageId = provider === 'postal'
           ? await deliverEmail(settings, initial.communication, env)
           : await deliverWhatsApp(settings, initial.communication, env);
@@ -325,7 +377,10 @@ function createCommunicationsHandler({
       let completed;
       for (let attempt = 0; attempt < 3; attempt += 1) {
         try {
-          completed = await withTransaction(userId, async (client) => {
+          completed = await withWorkspace(
+            userId,
+            workspaceId,
+            async (client) => {
             const current = await loadWorkspaceFn(client, userId);
             if (!current.snapshot) {
               throw new HttpError(404, 'workspace_not_found');
@@ -357,14 +412,13 @@ function createCommunicationsHandler({
               await client.query(
                 `UPDATE communication_messages
                  SET provider_message_id = $3
-                 WHERE workspace_id IN (
-                   SELECT id FROM workspaces WHERE owner_user_id = $1
-                 ) AND id = $2`,
-                [userId, updated.id, providerMessageId],
+                 WHERE workspace_id = $1 AND id = $2`,
+                [workspaceId, updated.id, providerMessageId],
               );
             }
             return { communication: updated, revision };
-          });
+            },
+          );
           break;
         } catch (error) {
           if (!(error instanceof HttpError) ||
@@ -380,10 +434,13 @@ function createCommunicationsHandler({
       });
     } catch (error) {
       if (respondToRateLimit(error, res)) return;
-      if (error instanceof HttpError ||
+      if (error instanceof HttpError || error instanceof WorkspaceAccessError ||
           (Number.isInteger(error?.statusCode) && error.statusCode === 401)) {
         return res.status(error.statusCode).json({
-          error: error instanceof HttpError ? error.code : 'unauthorized',
+          error: error instanceof HttpError ||
+              error instanceof WorkspaceAccessError
+            ? error.code
+            : 'unauthorized',
         });
       }
       logger('Communications API request failed.', {

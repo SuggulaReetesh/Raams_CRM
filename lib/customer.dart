@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:raams_crm/communication.dart';
 import 'package:raams_crm/delivery.dart';
 import 'package:raams_crm/finance.dart';
+import 'package:raams_crm/procurement.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -297,6 +298,13 @@ class StudioPersona {
   static const manageFinancials = 'manageFinancials';
   static const viewCommunications = 'viewCommunications';
   static const manageCommunications = 'manageCommunications';
+  static const viewMaterials = 'inventory.view';
+  static const manageMaterials = 'inventory.manage';
+  static const viewVendors = 'procurement.view';
+  static const manageVendors = 'procurement.manage';
+  static const approveProcurement = 'procurement.approve';
+  static const viewProcurement = viewVendors;
+  static const manageProcurement = manageVendors;
 
   static const deliveryPermissionKeys = {
     viewProjects,
@@ -341,6 +349,11 @@ class StudioPersona {
     manageFinancials,
     viewCommunications,
     manageCommunications,
+    viewMaterials,
+    manageMaterials,
+    viewVendors,
+    manageVendors,
+    approveProcurement,
   };
 
   static const clientManagementPermissions = {
@@ -376,6 +389,11 @@ class StudioPersona {
         manageFinancials,
         viewCommunications,
         manageCommunications,
+        viewMaterials,
+        manageMaterials,
+        viewVendors,
+        manageVendors,
+        approveProcurement,
       ],
     ),
     StudioPersona(
@@ -385,6 +403,8 @@ class StudioPersona {
       permissions: [
         viewClients,
         viewCommunications,
+        viewMaterials,
+        viewVendors,
         manageCommunications,
         manageClients,
         manageRequirements,
@@ -419,6 +439,8 @@ class StudioPersona {
         managePunchList,
         viewWorkLogs,
         manageWorkLogs,
+        viewMaterials,
+        viewVendors,
         manageAttendance,
         manageApprovals,
         approveApprovals,
@@ -450,6 +472,8 @@ class StudioPersona {
         viewProjects,
         viewFiles,
         viewWorkLogs,
+        viewMaterials,
+        viewVendors,
       ],
     ),
   ];
@@ -508,6 +532,7 @@ class WorkspacePreferences {
     required this.studioName,
     required this.defaultPipelineStage,
     required this.activePersonaId,
+    required this.procurementApprovalPolicy,
   });
 
   factory WorkspacePreferences.defaults({
@@ -516,26 +541,32 @@ class WorkspacePreferences {
     studioName: 'Sravya Studio',
     defaultPipelineStage: defaultPipelineStage,
     activePersonaId: 'owner',
+    procurementApprovalPolicy: StudioProcurementApprovalPolicy.defaults(),
   );
 
   final String studioName;
   final String defaultPipelineStage;
   final String activePersonaId;
+  final StudioProcurementApprovalPolicy procurementApprovalPolicy;
 
   WorkspacePreferences copyWith({
     String? studioName,
     String? defaultPipelineStage,
     String? activePersonaId,
+    StudioProcurementApprovalPolicy? procurementApprovalPolicy,
   }) => WorkspacePreferences(
     studioName: studioName ?? this.studioName,
     defaultPipelineStage: defaultPipelineStage ?? this.defaultPipelineStage,
     activePersonaId: activePersonaId ?? this.activePersonaId,
+    procurementApprovalPolicy:
+        procurementApprovalPolicy ?? this.procurementApprovalPolicy,
   );
 
   Map<String, Object?> toJson() => {
     'studioName': studioName,
     'defaultPipelineStage': defaultPipelineStage,
     'activePersonaId': activePersonaId,
+    'procurementApprovalPolicy': procurementApprovalPolicy.toJson(),
   };
 
   factory WorkspacePreferences.fromJson(Object? value) {
@@ -556,6 +587,11 @@ class WorkspacePreferences {
       studioName: studioName,
       defaultPipelineStage: defaultPipelineStage,
       activePersonaId: activePersonaId,
+      procurementApprovalPolicy: value['procurementApprovalPolicy'] == null
+          ? StudioProcurementApprovalPolicy.defaults()
+          : StudioProcurementApprovalPolicy.fromJson(
+              value['procurementApprovalPolicy'],
+            ),
     );
   }
 }
@@ -583,6 +619,10 @@ class CustomerWorkspace {
 }
 
 abstract interface class CustomerWorkspaceRepository {
+  Future<List<StudioLineItemCatalogEntry>> loadLineItemCatalog();
+
+  Future<void> saveLineItemCatalogEntry(StudioLineItemCatalogEntry entry);
+
   Future<CustomerWorkspace> loadWorkspace({
     required List<Customer> initialCustomers,
     required List<String> initialStages,
@@ -605,8 +645,71 @@ class SharedPreferencesCustomerWorkspaceRepository
   const SharedPreferencesCustomerWorkspaceRepository();
 
   static const _workspaceKey = 'atelier.workspace.v1';
+  static const _lineItemCatalogKey = 'atelier.quotation.lineItems.v1';
   static const _legacyCustomersKey = 'atelier.customers.v1';
   static const _legacyStagesKey = 'atelier.pipeline.stages.v1';
+
+  @override
+  Future<List<StudioLineItemCatalogEntry>> loadLineItemCatalog() async {
+    final preferences = await SharedPreferences.getInstance();
+    final savedCatalog = preferences.getString(_lineItemCatalogKey);
+    if (savedCatalog == null) {
+      return StudioLineItemCatalogEntry.starterItems;
+    }
+    final decoded = jsonDecode(savedCatalog);
+    if (decoded is! List<dynamic>) {
+      throw const FormatException('Saved line-item catalog data is invalid.');
+    }
+    return decoded
+        .map(StudioLineItemCatalogEntry.fromJson)
+        .toList(growable: false);
+  }
+
+  @override
+  Future<void> saveLineItemCatalogEntry(
+    StudioLineItemCatalogEntry entry,
+  ) async {
+    if (entry.name.trim().isEmpty || entry.name.length > 120) {
+      throw const FormatException(
+        'Enter a line item name up to 120 characters.',
+      );
+    }
+    for (final rate in [
+      entry.basicRatePerSqft,
+      entry.mediumRatePerSqft,
+      entry.luxuryRatePerSqft,
+    ]) {
+      if (rate != null && (!rate.isFinite || rate < 0)) {
+        throw const FormatException(
+          'Catalog rates must be finite non-negative amounts.',
+        );
+      }
+    }
+    final catalog = await loadLineItemCatalog();
+    if (catalog.any(
+      (item) =>
+          item.id != entry.id &&
+          item.name.trim().toLowerCase() == entry.name.trim().toLowerCase(),
+    )) {
+      throw const FormatException(
+        'A line item with this name already exists in the workspace.',
+      );
+    }
+    final containsEntry = catalog.any((item) => item.id == entry.id);
+    final updatedCatalog = containsEntry
+        ? catalog.map((item) => item.id == entry.id ? entry : item).toList()
+        : [...catalog, entry];
+    final preferences = await SharedPreferences.getInstance();
+    final saved = await preferences.setString(
+      _lineItemCatalogKey,
+      jsonEncode(updatedCatalog.map((item) => item.toJson()).toList()),
+    );
+    if (!saved) {
+      throw Exception(
+        'The line-item catalog could not be saved on this device.',
+      );
+    }
+  }
 
   Future<bool> hasSavedWorkspaceData() async {
     final preferences = await SharedPreferences.getInstance();
@@ -704,6 +807,9 @@ class SharedPreferencesCustomerWorkspaceRepository
     }
     if (schemaVersion == null || schemaVersion < 4) {
       personas = _migrateCommunicationPermissions(personas);
+    }
+    if (schemaVersion == null || schemaVersion < 5) {
+      personas = _migrateMasterDataPermissions(personas);
     }
     final preferencesJson = decoded['preferences'];
     final workspacePreferences = preferencesJson == null
@@ -827,7 +933,7 @@ class SharedPreferencesCustomerWorkspaceRepository
       communications: communications,
     );
     return {
-      'schemaVersion': 4,
+      'schemaVersion': 5,
       'customers': customers.map((customer) => customer.toJson()).toList(),
       'pipelineStages': pipelineStages,
       'activities': activities.map((activity) => activity.toJson()).toList(),
@@ -901,6 +1007,35 @@ class SharedPreferencesCustomerWorkspaceRepository
         permissions: [
           ...persona.permissions,
           ...communicationPermissions.where(
+            (permission) => !persona.permissions.contains(permission),
+          ),
+        ],
+      );
+    }).toList();
+  }
+
+  List<StudioPersona> _migrateMasterDataPermissions(
+    List<StudioPersona> personas,
+  ) {
+    final defaults = {
+      for (final persona in StudioPersona.defaults()) persona.id: persona,
+    };
+    const masterDataPermissions = {
+      StudioPersona.viewMaterials,
+      StudioPersona.manageMaterials,
+      StudioPersona.viewVendors,
+      StudioPersona.manageVendors,
+    };
+    return personas.map((persona) {
+      final defaultPersona = defaults[persona.id];
+      if (defaultPersona == null) return persona;
+      final permissions = defaultPersona.permissions.where(
+        masterDataPermissions.contains,
+      );
+      return persona.copyWith(
+        permissions: [
+          ...persona.permissions,
+          ...permissions.where(
             (permission) => !persona.permissions.contains(permission),
           ),
         ],
@@ -1082,6 +1217,55 @@ class SharedPreferencesCustomerWorkspaceRepository
     }
     final personaIds = personas.map((persona) => persona.id).toSet();
     final communicationIds = communications.map((entry) => entry.id).toSet();
+    bool validProcurementCommunicationLink(StudioCommunication entry) {
+      if (entry.vendorId != null &&
+          !delivery.vendors.any((vendor) => vendor.id == entry.vendorId)) {
+        return false;
+      }
+      if (entry.procurementRecordType == null &&
+          entry.procurementRecordId == null) {
+        return true;
+      }
+      if (entry.procurementRecordType == null ||
+          entry.procurementRecordId == null ||
+          entry.projectId == null) {
+        return false;
+      }
+      switch (entry.procurementRecordType) {
+        case 'requisition':
+          return entry.vendorId == null &&
+              delivery.requisitions.any(
+                (record) =>
+                    record.id == entry.procurementRecordId &&
+                    record.projectId == entry.projectId,
+              );
+        case 'rfq':
+          return delivery.rfqs.any(
+            (record) =>
+                record.id == entry.procurementRecordId &&
+                record.projectId == entry.projectId &&
+                (entry.vendorId == null ||
+                    record.vendorIds.contains(entry.vendorId)),
+          );
+        case 'quote':
+          return delivery.vendorQuotes.any(
+            (record) =>
+                record.id == entry.procurementRecordId &&
+                record.projectId == entry.projectId &&
+                (entry.vendorId == null || record.vendorId == entry.vendorId),
+          );
+        case 'purchaseOrder':
+          return delivery.purchaseOrders.any(
+            (record) =>
+                record.id == entry.procurementRecordId &&
+                record.projectId == entry.projectId &&
+                (entry.vendorId == null || record.vendorId == entry.vendorId),
+          );
+        default:
+          return false;
+      }
+    }
+
     if (communicationIds.length != communications.length ||
         communications.any(
           (entry) =>
@@ -1103,6 +1287,7 @@ class SharedPreferencesCustomerWorkspaceRepository
                         project.customerId != null &&
                         entry.clientId != project.customerId,
                   )) ||
+              !validProcurementCommunicationLink(entry) ||
               entry.channel.length > 30 ||
               !StudioCommunication.channels.contains(entry.channel) ||
               entry.subject.length > 200 ||
@@ -1175,6 +1360,17 @@ class SharedPreferencesCustomerWorkspaceRepository
               project.id.trim().isEmpty ||
               project.name.trim().isEmpty ||
               project.name.length > 120 ||
+              project.location.length > 200 ||
+              (project.budget != null &&
+                  (!project.budget!.isFinite ||
+                      project.budget! < 0 ||
+                      project.budget! > 1000000000000 ||
+                      (project.budget! * 100 - (project.budget! * 100).round())
+                              .abs() >
+                          1e-8)) ||
+              (project.startDate != null &&
+                  project.targetDate != null &&
+                  project.startDate!.isAfter(project.targetDate!)) ||
               !StudioProject.statuses.contains(project.status) ||
               (project.customerId != null &&
                   !customers.any(
@@ -1183,13 +1379,47 @@ class SharedPreferencesCustomerWorkspaceRepository
         )) {
       throw const FormatException('Project records are invalid.');
     }
+    final phasesById = {for (final phase in delivery.phases) phase.id: phase};
+    final phasePositions = delivery.phases
+        .map((phase) => '${phase.projectId}:${phase.position}')
+        .toSet();
+    final phaseNames = delivery.phases
+        .map((phase) => '${phase.projectId}:${phase.name.trim().toLowerCase()}')
+        .toSet();
+    if (phasesById.length != delivery.phases.length ||
+        phasePositions.length != delivery.phases.length ||
+        phaseNames.length != delivery.phases.length ||
+        delivery.phases.any(
+          (phase) =>
+              !projectIds.contains(phase.projectId) ||
+              phase.id.trim().isEmpty ||
+              phase.name.trim().isEmpty ||
+              phase.name.length > 120 ||
+              phase.position < 0 ||
+              !StudioProjectPhase.statuses.contains(phase.status) ||
+              (phase.startDate != null &&
+                  phase.endDate != null &&
+                  phase.startDate!.isAfter(phase.endDate!)),
+        )) {
+      throw const FormatException('Project phases are invalid.');
+    }
     if (delivery.tasks.any(
       (task) =>
           !projectIds.contains(task.projectId) ||
           task.id.trim().isEmpty ||
           task.title.trim().isEmpty ||
-          task.assignee.trim().isEmpty ||
-          !StudioTaskRecord.priorities.contains(task.priority),
+          !StudioTaskRecord.priorities.contains(task.priority) ||
+          task.dependsOnTaskIds.toSet().length !=
+              task.dependsOnTaskIds.length ||
+          task.dependsOnTaskIds.any(
+            (dependencyId) =>
+                dependencyId == task.id ||
+                !delivery.tasks.any(
+                  (dependency) =>
+                      dependency.id == dependencyId &&
+                      dependency.projectId == task.projectId,
+                ),
+          ),
     )) {
       throw const FormatException('Project tasks are invalid.');
     }
@@ -1197,18 +1427,344 @@ class SharedPreferencesCustomerWorkspaceRepository
     if (taskIds.length != delivery.tasks.length) {
       throw const FormatException('Project task IDs must be unique.');
     }
+    final taskById = {for (final task in delivery.tasks) task.id: task};
+    final dependents = {for (final task in delivery.tasks) task.id: <String>[]};
+    final dependencyCounts = {
+      for (final task in delivery.tasks) task.id: task.dependsOnTaskIds.length,
+    };
+    for (final task in delivery.tasks) {
+      for (final dependencyId in task.dependsOnTaskIds) {
+        dependents[dependencyId]!.add(task.id);
+      }
+    }
+    final readyTaskIds = dependencyCounts.entries
+        .where((entry) => entry.value == 0)
+        .map((entry) => entry.key)
+        .toList();
+    var scheduledTaskCount = 0;
+    while (readyTaskIds.isNotEmpty) {
+      final taskId = readyTaskIds.removeLast();
+      scheduledTaskCount++;
+      for (final dependentId in dependents[taskId]!) {
+        dependencyCounts[dependentId] = dependencyCounts[dependentId]! - 1;
+        if (dependencyCounts[dependentId] == 0) readyTaskIds.add(dependentId);
+      }
+    }
+    if (scheduledTaskCount != taskById.length) {
+      throw const FormatException('Project task dependencies contain a cycle.');
+    }
     if (delivery.milestones.any(
       (item) =>
           !projectIds.contains(item.projectId) ||
           item.id.trim().isEmpty ||
           item.title.trim().isEmpty ||
-          !StudioMilestone.statuses.contains(item.status),
+          !StudioMilestone.statuses.contains(item.status) ||
+          (item.phaseId != null &&
+              phasesById[item.phaseId]?.projectId != item.projectId),
     )) {
       throw const FormatException('Project milestones are invalid.');
     }
     if (delivery.milestones.map((item) => item.id).toSet().length !=
         delivery.milestones.length) {
       throw const FormatException('Project milestone IDs must be unique.');
+    }
+    if (delivery.materials
+                .map((item) => item.name.trim().toLowerCase())
+                .toSet()
+                .length !=
+            delivery.materials.length ||
+        delivery.materials.any(
+          (item) =>
+              item.id.trim().isEmpty ||
+              item.name.trim().isEmpty ||
+              item.name.length > 160 ||
+              item.category.trim().isEmpty ||
+              item.category.length > 80 ||
+              !StudioMaterial.categories.contains(item.category) ||
+              !StudioMaterial.units.contains(item.unit) ||
+              item.specification.length > 500 ||
+              item.description.length > 1000,
+        )) {
+      throw const FormatException('Material catalogue records are invalid.');
+    }
+    if (delivery.vendors
+                .map((item) => item.name.trim().toLowerCase())
+                .toSet()
+                .length !=
+            delivery.vendors.length ||
+        delivery.vendors.any(
+          (vendor) =>
+              vendor.id.trim().isEmpty ||
+              vendor.name.trim().isEmpty ||
+              vendor.name.length > 160 ||
+              !StudioVendor.kinds.contains(vendor.kind) ||
+              vendor.email.length > 254 ||
+              (vendor.email.trim().isNotEmpty &&
+                  !RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+                      .hasMatch(vendor.email)) ||
+              vendor.phone.length > 40 ||
+              (vendor.phone.trim().isNotEmpty &&
+                  vendor.phone.replaceAll(RegExp(r'\D'), '').length < 7) ||
+              vendor.address.length > 500 ||
+              vendor.taxId.length > 80 ||
+              vendor.paymentTerms.length > 120 ||
+              vendor.notes.length > 2000 ||
+              vendor.documents.length > 100 ||
+              vendor.documents.map((document) => document.id).toSet().length !=
+                  vendor.documents.length ||
+              vendor.documents.any(
+                (document) =>
+                    document.id.trim().isEmpty ||
+                    document.name.trim().isEmpty ||
+                    document.name.length > 200 ||
+                    document.documentType.trim().isEmpty ||
+                    document.documentType.length > 80 ||
+                    document.reference.length > 160,
+              ),
+        )) {
+      throw const FormatException('Vendor records are invalid.');
+    }
+    bool validApprovalSteps(
+      String status,
+      List<StudioProcurementApprovalStep> steps,
+    ) {
+      if (steps.length > 5 ||
+          steps.map((step) => step.permission).toSet().length != steps.length ||
+          steps.any(
+            (step) =>
+                !StudioProcurementApprovalPolicy.supportedPermissions.contains(
+                  step.permission,
+                ) ||
+                !StudioProcurementApprovalStep.statuses.contains(step.status) ||
+                step.decisionNote.length > 500 ||
+                (step.status == 'Pending' && step.decidedAt != null) ||
+                (step.status != 'Pending' && step.decidedAt == null),
+          )) {
+        return false;
+      }
+      if (status == 'Draft') return steps.isEmpty;
+      if (status == 'Pending approval') {
+        return steps.isNotEmpty &&
+            steps.any((step) => step.status == 'Pending') &&
+            !steps.any((step) => step.status == 'Rejected');
+      }
+      if (status == 'Approved') {
+        return steps.isNotEmpty &&
+            steps.every((step) => step.status == 'Approved');
+      }
+      return status == 'Rejected' &&
+          steps.any((step) => step.status == 'Rejected');
+    }
+
+    final requisitionsById = {
+      for (final requisition in delivery.requisitions)
+        requisition.id: requisition,
+    };
+    final vendorsById = {
+      for (final vendor in delivery.vendors) vendor.id: vendor,
+    };
+    final materialsById = {
+      for (final material in delivery.materials) material.id: material,
+    };
+    final requisitionIds = delivery.requisitions.map((item) => item.id).toSet();
+    if (requisitionIds.length != delivery.requisitions.length ||
+        delivery.requisitions.any(
+          (requisition) =>
+              !projectIds.contains(requisition.projectId) ||
+              requisition.title.trim().isEmpty ||
+              requisition.title.length > 160 ||
+              requisition.notes.length > 2000 ||
+              !StudioMaterialRequisition.statuses.contains(
+                requisition.status,
+              ) ||
+              !validApprovalSteps(
+                requisition.status,
+                requisition.approvalSteps,
+              ) ||
+              requisition.items.isEmpty ||
+              requisition.items.length > 100 ||
+              requisition.items.map((item) => item.id).toSet().length !=
+                  requisition.items.length ||
+              requisition.items.any(
+                (item) =>
+                    item.id.trim().isEmpty ||
+                    !materialsById.containsKey(item.materialId) ||
+                    item.name.trim().isEmpty ||
+                    item.name.length > 160 ||
+                    item.unit.trim().isEmpty ||
+                    item.unit.length > 20 ||
+                    item.quantityMilli < 1 ||
+                    item.quantityMilli > 1000000000 ||
+                    item.specification.length > 500,
+              ),
+        )) {
+      throw const FormatException('Material requisitions are invalid.');
+    }
+    final rfqsById = {for (final rfq in delivery.rfqs) rfq.id: rfq};
+    if (rfqsById.length != delivery.rfqs.length ||
+        delivery.rfqs.any(
+          (rfq) =>
+              !projectIds.contains(rfq.projectId) ||
+              requisitionsById[rfq.requisitionId]?.projectId != rfq.projectId ||
+              requisitionsById[rfq.requisitionId]?.status != 'Approved' ||
+              rfq.vendorIds.isEmpty ||
+              rfq.vendorIds.toSet().length != rfq.vendorIds.length ||
+              rfq.vendorIds.any(
+                (vendorId) => vendorsById[vendorId]?.kind != 'Supplier',
+              ) ||
+              !StudioRequestForQuotation.statuses.contains(rfq.status) ||
+              rfq.notes.length > 2000,
+        )) {
+      throw const FormatException('Vendor quotation requests are invalid.');
+    }
+    final quotesById = {
+      for (final quote in delivery.vendorQuotes) quote.id: quote,
+    };
+    if (quotesById.length != delivery.vendorQuotes.length ||
+        delivery.vendorQuotes.any((quote) {
+          final rfq = rfqsById[quote.rfqId];
+          final requisition = rfq == null
+              ? null
+              : requisitionsById[rfq.requisitionId];
+          final expectedLines = requisition?.items ?? const [];
+          final calculated = quote.items.fold<int>(0, (total, line) {
+            final requestLine = expectedLines
+                .where((item) => item.id == line.requisitionLineId)
+                .firstOrNull;
+            if (requestLine == null || line.unitPriceMinor < 0) {
+              return -1;
+            }
+            return total +
+                (requestLine.quantityMilli * line.unitPriceMinor / 1000)
+                    .round();
+          });
+          return rfq == null ||
+              quote.projectId != rfq.projectId ||
+              !rfq.vendorIds.contains(quote.vendorId) ||
+              quote.items.length != expectedLines.length ||
+              quote.items
+                      .map((item) => item.requisitionLineId)
+                      .toSet()
+                      .length !=
+                  quote.items.length ||
+              quote.items.any(
+                (item) =>
+                    !expectedLines.any(
+                      (requestLine) => requestLine.id == item.requisitionLineId,
+                    ) ||
+                    item.unitPriceMinor < 0 ||
+                    item.unitPriceMinor > 1000000000000,
+              ) ||
+              quote.totalMinor != calculated ||
+              quote.totalMinor <= 0 ||
+              !RegExp(r'^[A-Z]{3}$').hasMatch(quote.currency) ||
+              !StudioVendorQuote.statuses.contains(quote.status) ||
+              (quote.deliveryDays != null &&
+                  (quote.deliveryDays! < 0 || quote.deliveryDays! > 3650)) ||
+              quote.terms.length > 2000;
+        }) ||
+        delivery.vendorQuotes
+                .where((quote) => quote.status == 'Selected')
+                .map((quote) => quote.rfqId)
+                .toSet()
+                .length !=
+            delivery.vendorQuotes
+                .where((quote) => quote.status == 'Selected')
+                .length) {
+      throw const FormatException('Vendor quotations are invalid.');
+    }
+    final purchaseOrderQuoteIds = <String>{};
+    if (delivery.purchaseOrders.any((order) {
+      final requisition = requisitionsById[order.requisitionId];
+      final rfq = rfqsById[order.rfqId];
+      final quote = quotesById[order.quoteId];
+      final expectedItems = requisition == null || quote == null
+          ? const <StudioPurchaseOrderLine>[]
+          : requisition.items.map((requestLine) {
+              final quoteLine = quote.items
+                  .where((item) => item.requisitionLineId == requestLine.id)
+                  .firstOrNull;
+              final lineTotal = quoteLine == null
+                  ? -1
+                  : (requestLine.quantityMilli *
+                            quoteLine.unitPriceMinor /
+                            1000)
+                        .round();
+              return StudioPurchaseOrderLine(
+                requisitionLineId: requestLine.id,
+                description: requestLine.name,
+                unit: requestLine.unit,
+                quantityMilli: requestLine.quantityMilli,
+                unitPriceMinor: quoteLine?.unitPriceMinor ?? -1,
+                lineTotalMinor: lineTotal,
+              );
+            }).toList();
+      final expectedTotal = expectedItems.fold<int>(
+        0,
+        (total, item) => total + item.lineTotalMinor,
+      );
+      final duplicateQuote = !purchaseOrderQuoteIds.add(order.quoteId);
+      return duplicateQuote ||
+          requisition == null ||
+          requisition.status != 'Approved' ||
+          rfq == null ||
+          rfq.projectId != order.projectId ||
+          rfq.requisitionId != order.requisitionId ||
+          quote == null ||
+          quote.status != 'Selected' ||
+          quote.vendorId != order.vendorId ||
+          quote.currency != order.currency ||
+          order.items.length != expectedItems.length ||
+          order.items.asMap().entries.any(
+            (entry) =>
+                entry.value.requisitionLineId !=
+                    expectedItems[entry.key].requisitionLineId ||
+                entry.value.description !=
+                    expectedItems[entry.key].description ||
+                entry.value.unit != expectedItems[entry.key].unit ||
+                entry.value.quantityMilli !=
+                    expectedItems[entry.key].quantityMilli ||
+                entry.value.unitPriceMinor !=
+                    expectedItems[entry.key].unitPriceMinor ||
+                entry.value.lineTotalMinor !=
+                    expectedItems[entry.key].lineTotalMinor,
+          ) ||
+          order.totalMinor != expectedTotal ||
+          order.totalMinor <= 0 ||
+          !StudioPurchaseOrder.statuses.contains(order.status) ||
+          !validApprovalSteps(
+            order.status == 'Draft'
+                ? 'Draft'
+                : order.status == 'Pending approval'
+                ? 'Pending approval'
+                : order.status == 'Rejected'
+                ? 'Rejected'
+                : 'Approved',
+            order.approvalSteps,
+          ) ||
+          (order.status == 'Issued' && order.issuedAt == null) ||
+          (order.status != 'Issued' && order.issuedAt != null);
+    })) {
+      throw const FormatException('Purchase orders are invalid.');
+    }
+    final approvalPolicy = preferences.procurementApprovalPolicy;
+    if ([
+      approvalPolicy.requisitionPermissions,
+      approvalPolicy.purchaseOrderPermissions,
+    ].any(
+      (permissions) =>
+          permissions.isEmpty ||
+          permissions.length > 5 ||
+          permissions.toSet().length != permissions.length ||
+          permissions.any(
+            (permission) => !StudioProcurementApprovalPolicy
+                .supportedPermissions
+                .contains(permission),
+          ),
+    )) {
+      throw const FormatException(
+        'Procurement approval configuration is invalid.',
+      );
     }
     if (delivery.punchItems.any(
       (item) =>

@@ -3,7 +3,7 @@ const {
   createHmac,
   timingSafeEqual,
 } = require('node:crypto');
-const { getPool, withUserTransaction } = require('../_lib/database');
+const { getPool, withWorkspaceTransaction } = require('../_lib/database');
 const { HttpError, loadWorkspace, saveWorkspace } = require('../workspace');
 const { attachRequestId } = require('../_lib/request_id');
 
@@ -75,7 +75,10 @@ async function persistWebhookEvent({
   occurredAt,
   operation,
 }) {
-  return withUserTransaction(ownerUserId, async (client) => {
+  return withWorkspaceTransaction(
+    ownerUserId,
+    workspaceId,
+    async (client) => {
     const inserted = await client.query(
       `INSERT INTO communication_provider_events
          (workspace_id, provider, event_id, provider_message_id, event_type,
@@ -95,7 +98,8 @@ async function persistWebhookEvent({
     if (inserted.rowCount === 0) return false;
     await operation(client);
     return true;
-  });
+    },
+  );
 }
 
 async function updateOutboundStatus({

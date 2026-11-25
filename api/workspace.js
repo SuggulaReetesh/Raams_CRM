@@ -1,5 +1,15 @@
 const { authenticateRequest } = require('./_lib/auth');
-const { withUserTransaction } = require('./_lib/database');
+const {
+  hasPermission,
+  requirePermission,
+  WorkspaceAccessError,
+  withWorkspaceTransaction,
+} = require('./_lib/database');
+const { getWorkspaceId } = require('./_lib/workspace_context');
+const {
+  validateProcurementSnapshot,
+  validateProcurementTransitions,
+} = require('./_lib/procurement');
 const {
   enforceUserRateLimit,
   respondToRateLimit,
@@ -11,6 +21,7 @@ const collectionFields = new Map([
   ['activities', ['activities', 'activities']],
   ['personas', ['personas', 'personas']],
   ['projects', ['delivery', 'projects']],
+  ['phases', ['delivery', 'phases']],
   ['tasks', ['delivery', 'tasks']],
   ['milestones', ['delivery', 'milestones']],
   ['punchItems', ['delivery', 'punchItems']],
@@ -18,14 +29,35 @@ const collectionFields = new Map([
   ['workLogs', ['delivery', 'workLogs']],
   ['attendance', ['delivery', 'attendance']],
   ['approvals', ['delivery', 'approvals']],
+  ['materials', ['delivery', 'materials']],
+  ['vendors', ['delivery', 'vendors']],
+  ['requisitions', ['delivery', 'requisitions']],
+  ['rfqs', ['delivery', 'rfqs']],
+  ['vendorQuotes', ['delivery', 'vendorQuotes']],
+  ['purchaseOrders', ['delivery', 'purchaseOrders']],
+  ['stockBalances', ['delivery', 'stockBalances']],
+  ['goodsReceipts', ['delivery', 'goodsReceipts']],
+  ['stockMovements', ['delivery', 'stockMovements']],
+  ['workOrders', ['delivery', 'workOrders']],
+  ['dailyReports', ['delivery', 'dailyReports']],
+  ['siteInspections', ['delivery', 'siteInspections']],
+  ['workers', ['delivery', 'workers']],
+  ['workforceAllocations', ['delivery', 'workforceAllocations']],
+  ['siteAttendance', ['delivery', 'siteAttendance']],
+  ['importRecords', ['delivery', 'importRecords']],
+  ['reportSnapshots', ['delivery', 'reportSnapshots']],
   ['quotations', ['financials', 'quotations']],
   ['templates', ['financials', 'templates']],
   ['proposals', ['financials', 'proposals']],
   ['invoices', ['financials', 'invoices']],
   ['communications', ['communications', 'communications']],
+  ['projectExpenditures', ['financials', 'projectExpenditures']],
+  ['vendorBills', ['financials', 'vendorBills']],
+  ['bankReconciliations', ['financials', 'bankReconciliations']],
 ]);
 const collectionNames = new Set([
   ...collectionFields.keys(),
+  'procurementAudit',
   'invoicePayments',
   'pipelineStages',
   'preferences',
@@ -38,6 +70,7 @@ const changePathCollections = new Map([
   ['personas', 'personas'],
   ['preferences', null],
   ['delivery.projects', 'projects'],
+  ['delivery.phases', 'phases'],
   ['delivery.tasks', 'tasks'],
   ['delivery.milestones', 'milestones'],
   ['delivery.punchItems', 'punchItems'],
@@ -45,12 +78,287 @@ const changePathCollections = new Map([
   ['delivery.workLogs', 'workLogs'],
   ['delivery.attendance', 'attendance'],
   ['delivery.approvals', 'approvals'],
+  ['delivery.materials', 'materials'],
+  ['delivery.vendors', 'vendors'],
+  ['delivery.requisitions', 'requisitions'],
+  ['delivery.rfqs', 'rfqs'],
+  ['delivery.vendorQuotes', 'vendorQuotes'],
+  ['delivery.purchaseOrders', 'purchaseOrders'],
+  ['delivery.stockBalances', 'stockBalances'],
+  ['delivery.goodsReceipts', 'goodsReceipts'],
+  ['delivery.stockMovements', 'stockMovements'],
+  ['delivery.workOrders', 'workOrders'],
+  ['delivery.dailyReports', 'dailyReports'],
+  ['delivery.siteInspections', 'siteInspections'],
+  ['delivery.workers', 'workers'],
+  ['delivery.workforceAllocations', 'workforceAllocations'],
+  ['delivery.siteAttendance', 'siteAttendance'],
+  ['delivery.importRecords', 'importRecords'],
+  ['delivery.reportSnapshots', 'reportSnapshots'],
   ['financials.quotations', 'quotations'],
   ['financials.templates', 'templates'],
   ['financials.proposals', 'proposals'],
   ['financials.invoices', 'invoices'],
   ['financials.settings', null],
+  ['financials.projectExpenditures', 'projectExpenditures'],
+  ['financials.vendorBills', 'vendorBills'],
+  ['financials.bankReconciliations', 'bankReconciliations'],
   ['communications', 'communications'],
+]);
+const collectionWritePermissions = new Map([
+  ['customers', 'manageClients'],
+  ['pipelineStages', 'managePipeline'],
+  ['activities', 'manageClients'],
+  ['personas', 'configureWorkspace'],
+  ['projects', 'manageProjects'],
+  ['phases', 'manageMilestones'],
+  ['tasks', 'manageTasks'],
+  ['milestones', 'manageMilestones'],
+  ['punchItems', 'managePunchList'],
+  ['assets', 'manageFiles'],
+  ['workLogs', 'manageWorkLogs'],
+  ['attendance', 'manageAttendance'],
+  ['approvals', 'manageApprovals'],
+  ['materials', 'inventory.manage'],
+  ['vendors', 'procurement.manage'],
+  ['requisitions', 'procurement.manage'],
+  ['rfqs', 'procurement.manage'],
+  ['vendorQuotes', 'procurement.manage'],
+  ['purchaseOrders', 'procurement.manage'],
+  ['stockBalances', 'inventory.manage'],
+  ['goodsReceipts', 'inventory.manage'],
+  ['stockMovements', 'inventory.manage'],
+  ['workOrders', 'manageProjects'],
+  ['dailyReports', 'manageWorkLogs'],
+  ['siteInspections', 'managePunchList'],
+  ['workers', 'manageAttendance'],
+  ['workforceAllocations', 'manageAttendance'],
+  ['siteAttendance', 'manageAttendance'],
+  ['importRecords', 'manageFiles'],
+  ['reportSnapshots', 'reports.view'],
+  ['quotations', 'manageFinancials'],
+  ['templates', 'manageFinancials'],
+  ['proposals', 'manageFinancials'],
+  ['invoices', 'manageFinancials'],
+  ['communications', 'manageCommunications'],
+  ['projectExpenditures', 'manageFinancials'],
+  ['vendorBills', 'manageFinancials'],
+  ['bankReconciliations', 'manageFinancials'],
+]);
+const collectionWritePermissionAliases = new Map([
+  ['projects', ['projects.manage']],
+  ['materials', ['inventory.manage']],
+  ['vendors', ['procurement.manage']],
+  ['requisitions', ['procurement.approve']],
+  ['rfqs', ['procurement.approve']],
+  ['vendorQuotes', ['procurement.approve']],
+  ['purchaseOrders', ['procurement.approve']],
+  ['stockBalances', ['inventory.manage']],
+  ['goodsReceipts', ['inventory.manage']],
+  ['stockMovements', ['inventory.manage']],
+  ['workOrders', ['manageProjects']],
+  ['dailyReports', ['manageWorkLogs']],
+  ['siteInspections', ['managePunchList']],
+  ['workers', ['manageAttendance']],
+  ['workforceAllocations', ['manageAttendance']],
+  ['siteAttendance', ['manageAttendance']],
+  ['importRecords', ['manageFiles']],
+  ['reportSnapshots', ['reports.view']],
+  ['quotations', ['finance.manage']],
+  ['templates', ['finance.manage']],
+  ['proposals', ['finance.manage']],
+  ['invoices', ['finance.manage']],
+  ['projectExpenditures', ['manageFinancials', 'finance.manage']],
+  ['vendorBills', ['manageFinancials', 'finance.manage']],
+  ['bankReconciliations', ['manageFinancials', 'finance.manage']],
+  ['importRecords', ['manageFiles', 'documents.manage']],
+  ['reportSnapshots', ['reports.view']],
+]);
+const projectCollectionWritePermissions = new Map([
+  ['projects', ['manageProjects', 'projects.manage']],
+  ['phases', ['manageMilestones']],
+  ['tasks', ['manageTasks']],
+  ['milestones', ['manageMilestones']],
+  ['punchItems', ['managePunchList']],
+  ['assets', ['manageFiles']],
+  ['workLogs', ['manageWorkLogs']],
+  ['attendance', ['manageAttendance']],
+  ['projectExpenditures', ['manageFinancials', 'finance.manage']],
+  ['vendorBills', ['manageFinancials', 'finance.manage']],
+  ['bankReconciliations', ['manageFinancials', 'finance.manage']],
+  ['approvals', ['manageApprovals', 'approveApprovals']],
+  ['requisitions', ['procurement.manage', 'procurement.approve']],
+  ['rfqs', ['procurement.manage', 'procurement.approve']],
+  ['vendorQuotes', ['procurement.manage', 'procurement.approve']],
+  ['purchaseOrders', ['procurement.manage', 'procurement.approve']],
+  ['stockBalances', ['inventory.view', 'inventory.manage']],
+  ['goodsReceipts', ['inventory.view', 'inventory.manage']],
+  ['stockMovements', ['inventory.view', 'inventory.manage']],
+  ['workOrders', ['viewProjects', 'manageProjects']],
+  ['dailyReports', ['viewWorkLogs', 'manageWorkLogs']],
+  ['siteInspections', ['viewProjects', 'managePunchList']],
+]);
+const collectionReadPermissions = new Map([
+  ['customers', ['viewClients']],
+  ['pipelineStages', ['viewClients']],
+  ['activities', ['viewClients']],
+  ['personas', ['configureWorkspace']],
+  ['projects', ['viewProjects', 'manageProjects', 'projects.view', 'projects.manage']],
+  ['phases', ['viewProjects', 'manageMilestones']],
+  ['materials', [
+    'inventory.view',
+    'inventory.manage',
+    'procurement.view',
+    'procurement.manage',
+  ]],
+  ['vendors', ['procurement.view', 'procurement.manage']],
+  ['requisitions', [
+    'procurement.view',
+    'procurement.manage',
+    'procurement.approve',
+  ]],
+  ['rfqs', [
+    'procurement.view',
+    'procurement.manage',
+    'procurement.approve',
+  ]],
+  ['vendorQuotes', [
+    'procurement.view',
+    'procurement.manage',
+    'procurement.approve',
+  ]],
+  ['purchaseOrders', [
+    'procurement.view',
+    'procurement.manage',
+    'procurement.approve',
+  ]],
+  ['stockBalances', ['inventory.view', 'inventory.manage']],
+  ['goodsReceipts', ['inventory.view', 'inventory.manage']],
+  ['stockMovements', ['inventory.view', 'inventory.manage']],
+  ['workOrders', ['viewProjects', 'manageProjects']],
+  ['dailyReports', ['viewWorkLogs', 'manageWorkLogs']],
+  ['siteInspections', ['viewProjects', 'managePunchList']],
+  ['workers', ['viewWorkLogs', 'manageAttendance']],
+  ['workforceAllocations', ['viewWorkLogs', 'manageAttendance']],
+  ['siteAttendance', ['viewWorkLogs', 'manageAttendance']],
+  ['procurementAudit', [
+    'procurement.view',
+    'procurement.manage',
+    'procurement.approve',
+  ]],
+  ['tasks', ['viewProjects', 'manageTasks']],
+  ['milestones', ['viewProjects', 'manageMilestones']],
+  ['punchItems', ['viewProjects', 'managePunchList']],
+  ['assets', ['viewProjects', 'viewFiles', 'manageFiles']],
+  ['workLogs', ['viewProjects', 'viewWorkLogs', 'manageWorkLogs']],
+  ['attendance', ['viewProjects', 'manageAttendance']],
+  ['projectExpenditures', ['viewFinancials', 'manageFinancials', 'finance.view', 'finance.manage']],
+  ['vendorBills', ['viewFinancials', 'manageFinancials', 'finance.view', 'finance.manage']],
+  ['bankReconciliations', ['viewFinancials', 'manageFinancials', 'finance.view', 'finance.manage']],
+  ['importRecords', ['viewFiles', 'manageFiles', 'documents.view', 'documents.manage']],
+  ['reportSnapshots', ['reports.view']],
+  ['approvals', ['viewProjects', 'manageApprovals', 'approveApprovals']],
+  ['quotations', ['viewFinancials', 'finance.view']],
+  ['templates', ['viewFinancials', 'finance.view']],
+  ['proposals', ['viewFinancials', 'finance.view']],
+  ['invoices', ['viewFinancials', 'finance.view']],
+  ['invoicePayments', ['viewFinancials', 'finance.view']],
+  ['financialSettings', ['viewFinancials', 'finance.view']],
+  ['communications', ['viewCommunications']],
+  ['projectExpenditures', ['viewFinancials', 'finance.view']],
+  ['vendorBills', ['viewFinancials', 'finance.view']],
+  ['bankReconciliations', ['viewFinancials', 'finance.view']],
+  ['importRecords', ['viewFiles', 'documents.view', 'documents.manage']],
+  ['reportSnapshots', ['reports.view']],
+  ['procurementAudit', [
+    'procurement.view',
+    'procurement.manage',
+    'procurement.approve',
+  ]],
+]);
+const projectCollectionReadPermissions = new Map([
+  ['customers', [
+    'viewProjects',
+    'manageProjects',
+    'projects.view',
+    'projects.manage',
+    'manageTasks',
+    'manageMilestones',
+    'managePunchList',
+    'viewFiles',
+    'manageFiles',
+    'viewWorkLogs',
+    'manageWorkLogs',
+    'manageAttendance',
+    'manageApprovals',
+    'approveApprovals',
+    'viewFinancials',
+    'manageFinancials',
+    'viewCommunications',
+    'manageCommunications',
+  ]],
+  ['projects', [
+    'viewProjects',
+    'manageProjects',
+    'projects.view',
+    'projects.manage',
+    'manageTasks',
+    'manageMilestones',
+    'managePunchList',
+    'viewFiles',
+    'manageFiles',
+    'viewWorkLogs',
+    'manageWorkLogs',
+    'manageAttendance',
+    'manageApprovals',
+    'approveApprovals',
+    'viewFinancials',
+    'manageFinancials',
+    'viewCommunications',
+    'manageCommunications',
+  ]],
+  ['phases', ['viewProjects', 'manageMilestones']],
+  ['tasks', ['viewProjects', 'manageTasks']],
+  ['milestones', ['viewProjects', 'manageMilestones']],
+  ['punchItems', ['viewProjects', 'managePunchList']],
+  ['assets', ['viewProjects', 'viewFiles', 'manageFiles']],
+  ['workLogs', ['viewProjects', 'viewWorkLogs', 'manageWorkLogs']],
+  ['attendance', ['viewProjects', 'manageAttendance']],
+  ['approvals', ['viewProjects', 'manageApprovals', 'approveApprovals']],
+  ['requisitions', [
+    'procurement.view',
+    'procurement.manage',
+    'procurement.approve',
+  ]],
+  ['rfqs', [
+    'procurement.view',
+    'procurement.manage',
+    'procurement.approve',
+  ]],
+  ['vendorQuotes', [
+    'procurement.view',
+    'procurement.manage',
+    'procurement.approve',
+  ]],
+  ['purchaseOrders', [
+    'procurement.view',
+    'procurement.manage',
+    'procurement.approve',
+  ]],
+  ['stockBalances', ['inventory.view', 'inventory.manage']],
+  ['goodsReceipts', ['inventory.view', 'inventory.manage']],
+  ['stockMovements', ['inventory.view', 'inventory.manage']],
+  ['workOrders', ['viewProjects', 'manageProjects']],
+  ['dailyReports', ['viewWorkLogs', 'manageWorkLogs']],
+  ['siteInspections', ['viewProjects', 'managePunchList']],
+  ['workers', ['viewWorkLogs', 'manageAttendance']],
+  ['workforceAllocations', ['viewWorkLogs', 'manageAttendance']],
+  ['siteAttendance', ['viewWorkLogs', 'manageAttendance']],
+  ['quotations', ['viewFinancials']],
+  ['proposals', ['viewFinancials']],
+  ['invoices', ['viewFinancials']],
+  ['invoicePayments', ['viewFinancials']],
+  ['communications', ['viewCommunications']],
 ]);
 const maximumRequestBytes = 3 * 1024 * 1024;
 const maximumRecordsPerCollection = 10000;
@@ -178,10 +486,164 @@ function validateFinancialNumbering(snapshot, existingDocumentIds, previousSetti
   }
 }
 
-function validateSnapshot(snapshot, userId) {
-  if (!isRecord(snapshot) || snapshot.schemaVersion !== 4) {
+function validateSiteExecutionSnapshot(snapshot) {
+  const delivery = snapshot.delivery;
+  const projectIds = new Set(
+    (delivery.projects || []).map((project) => project.id),
+  );
+  const workers = new Map(
+    (delivery.workers || []).map((worker) => [worker.id, worker]),
+  );
+  for (const worker of delivery.workers || []) {
+    if (!isRecord(worker) ||
+        !['Employee', 'Contractor'].includes(worker.kind) ||
+        typeof worker.name !== 'string' ||
+        worker.name.trim().length === 0 ||
+        !['Active', 'Inactive'].includes(worker.status)) {
+      throw new HttpError(400, 'invalid_worker');
+    }
+  }
+  for (const allocation of delivery.workforceAllocations || []) {
+    if (!isRecord(allocation) ||
+        !projectIds.has(allocation.projectId) ||
+        !workers.has(allocation.workerId) ||
+        workers.get(allocation.workerId)?.status !== 'Active') {
+      throw new HttpError(400, 'invalid_workforce_allocation');
+    }
+  }
+  for (const attendance of delivery.siteAttendance || []) {
+    if (!isRecord(attendance) ||
+        !projectIds.has(attendance.projectId) ||
+        !workers.has(attendance.workerId) ||
+        !['Present', 'Remote', 'Late', 'Away'].includes(attendance.status)) {
+      throw new HttpError(400, 'invalid_site_attendance');
+    }
+  }
+  for (const collection of [
+    'stockBalances',
+    'goodsReceipts',
+    'stockMovements',
+    'workOrders',
+    'dailyReports',
+    'siteInspections',
+    'workers',
+    'workforceAllocations',
+    'siteAttendance',
+    'importRecords',
+    'reportSnapshots',
+    'importRecords',
+    'reportSnapshots',
+  ]) {
+    const records = delivery[collection] || [];
+    if (!Array.isArray(records)) throw new HttpError(400, 'invalid_site_execution');
+    const ids = new Set();
+    for (const record of records) {
+      if (!isRecord(record) ||
+          typeof record.id !== 'string' ||
+          record.id.length < 1 ||
+          record.id.length > 160 ||
+          typeof record.projectId !== 'string' ||
+          !projectIds.has(record.projectId) ||
+          ids.has(record.id)) {
+        throw new HttpError(400, 'invalid_site_execution');
+      }
+      ids.add(record.id);
+    }
+  }
+
+  const orders = new Map(
+    (delivery.purchaseOrders || []).map((order) => [order.id, order]),
+  );
+  for (const receipt of delivery.goodsReceipts || []) {
+    const order = orders.get(receipt.purchaseOrderId);
+    if (!order ||
+        order.projectId !== receipt.projectId ||
+        order.status !== 'Issued') {
+      throw new HttpError(400, 'invalid_goods_receipt_purchase_order');
+    }
+    if (!Array.isArray(receipt.lines) ||
+        receipt.lines.length === 0 ||
+        typeof receipt.location !== 'string' ||
+        receipt.location.length > 160) {
+      throw new HttpError(400, 'invalid_goods_receipt');
+    }
+    const receivedByLine = new Map();
+    for (const line of receipt.lines) {
+      if (!isRecord(line) ||
+          typeof line.purchaseOrderLineId !== 'string' ||
+          !Number.isSafeInteger(line.quantityMilli) ||
+          line.quantityMilli < 1 ||
+          !Number.isSafeInteger(line.acceptedQuantityMilli) ||
+          line.acceptedQuantityMilli < 0 ||
+          line.acceptedQuantityMilli > line.quantityMilli ||
+          !order.items?.some((item) =>
+            item.requisitionLineId === line.purchaseOrderLineId ||
+            item.description === line.purchaseOrderLineId)) {
+        throw new HttpError(400, 'invalid_goods_receipt_line');
+      }
+      receivedByLine.set(
+        line.purchaseOrderLineId,
+        (receivedByLine.get(line.purchaseOrderLineId) || 0) + line.quantityMilli,
+      );
+    }
+  }
+
+  const receivedByPoLine = new Map();
+  for (const receipt of delivery.goodsReceipts || []) {
+    for (const line of receipt.lines || []) {
+      receivedByPoLine.set(
+        `${receipt.purchaseOrderId}:${line.purchaseOrderLineId}`,
+        (receivedByPoLine.get(
+          `${receipt.purchaseOrderId}:${line.purchaseOrderLineId}`,
+        ) || 0) + line.quantityMilli,
+      );
+    }
+  }
+  for (const [orderLineKey, receivedQuantity] of receivedByPoLine) {
+    const separator = orderLineKey.indexOf(':');
+    const orderId = orderLineKey.slice(0, separator);
+    const lineId = orderLineKey.slice(separator + 1);
+    const order = orders.get(orderId);
+    const orderLine = order?.items?.find((item) =>
+      item.requisitionLineId === lineId);
+    if (!orderLine ||
+        receivedQuantity > orderLine.quantityMilli) {
+      throw new HttpError(400, 'goods_receipt_exceeds_purchase_order');
+    }
+  }
+
+  for (const movement of delivery.stockMovements || []) {
+    if (!isRecord(movement) ||
+        !['Receipt', 'Transfer', 'Consumption', 'Adjustment'].includes(movement.kind) ||
+        !Number.isSafeInteger(movement.quantityMilli) ||
+        movement.quantityMilli < 1 ||
+        typeof movement.materialId !== 'string') {
+      throw new HttpError(400, 'invalid_stock_movement');
+    }
+  }
+  for (const balance of delivery.stockBalances || []) {
+    if (!isRecord(balance) ||
+        typeof balance.projectId !== 'string' ||
+        typeof balance.materialId !== 'string' ||
+        typeof balance.location !== 'string' ||
+        !projectIds.has(balance.projectId) ||
+        !Number.isSafeInteger(balance.quantityMilli) ||
+        balance.quantityMilli < 0) {
+      throw new HttpError(400, 'invalid_stock_balance');
+    }
+  }
+}
+
+function validateSnapshot(
+  snapshot,
+  userId,
+  workspaceId = null,
+  previousSnapshot = null,
+) {
+  if (!isRecord(snapshot) || ![4, 5].includes(snapshot.schemaVersion)) {
     throw new HttpError(400, 'invalid_workspace');
   }
+  snapshot.schemaVersion = 5;
   if (!Array.isArray(snapshot.customers) ||
       !Array.isArray(snapshot.pipelineStages) ||
       !Array.isArray(snapshot.activities) ||
@@ -192,6 +654,122 @@ function validateSnapshot(snapshot, userId) {
       !isRecord(snapshot.financials)) {
     throw new HttpError(400, 'invalid_workspace');
   }
+  if (!Array.isArray(snapshot.delivery.projects) ||
+      !Array.isArray(snapshot.delivery.tasks) ||
+      !Array.isArray(snapshot.delivery.milestones)) {
+    throw new HttpError(400, 'invalid_workspace');
+  }
+  for (const collection of ['phases', 'materials', 'vendors']) {
+    if (snapshot.delivery[collection] === undefined) {
+      snapshot.delivery[collection] = [];
+    }
+  }
+  for (const collection of [
+    'projectExpenditures',
+    'vendorBills',
+    'bankReconciliations',
+  ]) {
+    if (snapshot.financials[collection] === undefined) {
+      snapshot.financials[collection] = [];
+    }
+  }
+  for (const collection of [
+    'requisitions',
+    'rfqs',
+    'vendorQuotes',
+    'purchaseOrders',
+    'stockBalances',
+    'goodsReceipts',
+    'stockMovements',
+    'workOrders',
+    'dailyReports',
+    'siteInspections',
+    'workers',
+    'workforceAllocations',
+    'siteAttendance',
+    'importRecords',
+    'reportSnapshots',
+  ]) {
+    if (snapshot.delivery[collection] === undefined) {
+      snapshot.delivery[collection] = [];
+    }
+  }
+  if (snapshot.preferences.procurementApprovalPolicy === undefined) {
+    snapshot.preferences.procurementApprovalPolicy = {
+      requisitionPermissions: ['procurement.approve'],
+      purchaseOrderPermissions: ['procurement.approve', 'manageFinancials'],
+    };
+  }
+  for (const project of snapshot.delivery.projects) {
+    if (project.budget === undefined) project.budget = null;
+    if (project.startDate === undefined) project.startDate = null;
+  }
+  for (const task of snapshot.delivery.tasks) {
+    if (task.dependsOnTaskIds === undefined) task.dependsOnTaskIds = [];
+  }
+  for (const milestone of snapshot.delivery.milestones) {
+    if (milestone.phaseId === undefined) milestone.phaseId = null;
+  }
+  const ordersById = new Map(
+    (snapshot.delivery.purchaseOrders || []).map((order) => [order.id, order]),
+  );
+  const receiptsById = new Map(
+    (snapshot.delivery.goodsReceipts || []).map((receipt) => [receipt.id, receipt]),
+  );
+  for (const bill of snapshot.financials.projectExpenditures || []) {
+    if (!isRecord(bill) ||
+        typeof bill.projectId !== 'string' ||
+        !Number.isSafeInteger(bill.amountMinor) ||
+        bill.amountMinor < 0) {
+      throw new HttpError(400, 'invalid_project_expenditure');
+    }
+  }
+  for (const bill of snapshot.financials.vendorBills || []) {
+    const order = ordersById.get(bill.purchaseOrderId);
+    if (!isRecord(bill) ||
+        !order ||
+        order.projectId !== bill.projectId ||
+        order.status !== 'Issued' ||
+        (bill.vendorId !== undefined && bill.vendorId !== order.vendorId) ||
+        !Array.isArray(bill.receiptIds) ||
+        bill.receiptIds.length === 0 ||
+        bill.receiptIds.some((id) => {
+          const receipt = receiptsById.get(id);
+          return !receipt ||
+            receipt.projectId !== bill.projectId ||
+            receipt.purchaseOrderId !== bill.purchaseOrderId;
+        }) ||
+        !Number.isSafeInteger(bill.amountMinor) ||
+        bill.amountMinor <= 0 ||
+        bill.amountMinor > order.totalMinor ||
+        typeof bill.billNumber !== 'string' ||
+        bill.billNumber.trim().length === 0 ||
+        bill.billNumber.length > 160 ||
+        !['Open', 'Approved', 'Paid', 'Cancelled'].includes(bill.status)) {
+      throw new HttpError(400, 'invalid_vendor_bill');
+    }
+  }
+  for (const record of snapshot.delivery.importRecords || []) {
+    if (!isRecord(record) ||
+        typeof record.fileName !== 'string' ||
+        typeof record.status !== 'string' ||
+        !Number.isSafeInteger(record.importedCount) ||
+        record.importedCount < 0 ||
+        !Number.isSafeInteger(record.failedCount) ||
+        record.failedCount < 0) {
+      throw new HttpError(400, 'invalid_import_record');
+    }
+  }
+  for (const report of snapshot.delivery.reportSnapshots || []) {
+    if (!isRecord(report) ||
+        typeof report.projectId !== 'string' ||
+        !snapshot.delivery.projects.some((project) => project.id === report.projectId) ||
+        typeof report.kind !== 'string' ||
+        typeof report.summary !== 'string') {
+      throw new HttpError(400, 'invalid_report_snapshot');
+    }
+  }
+  validateSiteExecutionSnapshot(snapshot);
 
   for (const [collection, [parent, field]] of collectionFields) {
     const records = parent === 'customers' || parent === 'activities' ||
@@ -244,6 +822,116 @@ function validateSnapshot(snapshot, userId) {
     (project.targetDate != null && !isValidDateTime(project.targetDate)))) {
     throw new HttpError(400, 'invalid_project');
   }
+  if (projects.some((project) =>
+    project.budget !== null &&
+      (typeof project.budget !== 'number' ||
+        !Number.isFinite(project.budget) ||
+        project.budget < 0 ||
+        project.budget > 1000000000000 ||
+        Math.abs(project.budget * 100 -
+          Math.round(project.budget * 100)) > 1e-8) ||
+    (project.startDate != null && !isValidDateTime(project.startDate)) ||
+    (project.startDate != null && project.targetDate != null &&
+      new Date(project.startDate) > new Date(project.targetDate)))) {
+    throw new HttpError(400, 'invalid_project_schedule');
+  }
+  const phases = snapshot.delivery.phases;
+  const phaseIds = new Set(phases.map((phase) => phase.id));
+  const phasePositions = phases.map((phase) =>
+    `${phase.projectId}:${phase.position}`);
+  const phaseNames = phases.map((phase) =>
+    `${phase.projectId}:${phase.name.trim().toLowerCase()}`);
+  if (phases.some((phase) =>
+    typeof phase.name !== 'string' ||
+    phase.name.trim().length === 0 ||
+    phase.name.length > 120 ||
+    !Number.isInteger(phase.position) ||
+    phase.position < 0 ||
+    !['Not started', 'In progress', 'Complete'].includes(phase.status) ||
+    (phase.startDate != null && !isValidDateTime(phase.startDate)) ||
+    (phase.endDate != null && !isValidDateTime(phase.endDate)) ||
+    (phase.startDate != null && phase.endDate != null &&
+      new Date(phase.startDate) > new Date(phase.endDate))) ||
+      new Set(phasePositions).size !== phasePositions.length ||
+      new Set(phaseNames).size !== phaseNames.length) {
+    throw new HttpError(400, 'invalid_project_phase');
+  }
+  if (snapshot.delivery.materials.some((material) =>
+    typeof material.name !== 'string' ||
+    material.name.trim().length === 0 ||
+    material.name.length > 160 ||
+    typeof material.category !== 'string' ||
+    material.category.trim().length === 0 ||
+    material.category.length > 80 ||
+    ![
+      'Cement & concrete',
+      'Steel',
+      'Electrical',
+      'Plumbing',
+      'HVAC',
+      'Finishes',
+      'Fixtures',
+      'Safety',
+      'Other',
+    ].includes(material.category) ||
+    !['each', 'm', 'm2', 'm3', 'kg', 'L', 'set', 'bag']
+      .includes(material.unit) ||
+    typeof material.specification !== 'string' ||
+    material.specification.length > 500 ||
+    typeof material.description !== 'string' ||
+    material.description.length > 1000 ||
+    typeof material.isActive !== 'boolean') ||
+      new Set(snapshot.delivery.materials.map((material) =>
+        material.name.trim().toLowerCase())).size !==
+        snapshot.delivery.materials.length) {
+    throw new HttpError(400, 'invalid_material');
+  }
+  if (snapshot.delivery.vendors.some((vendor) =>
+    typeof vendor.name !== 'string' ||
+    vendor.name.trim().length === 0 ||
+    vendor.name.length > 160 ||
+    !['Supplier', 'Contractor'].includes(vendor.kind) ||
+    typeof vendor.email !== 'string' ||
+    vendor.email.length > 254 ||
+    (vendor.email.trim().length > 0 &&
+      !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(vendor.email)) ||
+    typeof vendor.phone !== 'string' ||
+    vendor.phone.length > 40 ||
+    (vendor.phone.trim().length > 0 &&
+      vendor.phone.replace(/\D/g, '').length < 7) ||
+    typeof vendor.address !== 'string' ||
+    vendor.address.length > 500 ||
+    typeof vendor.taxId !== 'string' ||
+    vendor.taxId.length > 80 ||
+    typeof vendor.paymentTerms !== 'string' ||
+    vendor.paymentTerms.length > 120 ||
+    typeof vendor.notes !== 'string' ||
+    vendor.notes.length > 2000 ||
+    typeof vendor.isActive !== 'boolean' ||
+    !Array.isArray(vendor.documents) ||
+    vendor.documents.length > 100 ||
+    vendor.documents.some((document) =>
+      !isRecord(document) ||
+      typeof document.id !== 'string' ||
+      document.id.trim().length === 0 ||
+      document.id.length > 160 ||
+      typeof document.name !== 'string' ||
+      document.name.trim().length === 0 ||
+      document.name.length > 200 ||
+      typeof document.documentType !== 'string' ||
+      document.documentType.trim().length === 0 ||
+      document.documentType.length > 80 ||
+      typeof document.reference !== 'string' ||
+      document.reference.length > 160 ||
+      (document.expiresAt != null &&
+        !isValidDateTime(document.expiresAt))) ||
+    new Set(vendor.documents.map((document) => document.id)).size !==
+      vendor.documents.length) ||
+      new Set(snapshot.delivery.vendors.map((vendor) =>
+        vendor.name.trim().toLowerCase())).size !==
+        snapshot.delivery.vendors.length) {
+    throw new HttpError(400, 'invalid_vendor');
+  }
   const taskIds = new Set(snapshot.delivery.tasks.map((task) => task.id));
   if (snapshot.delivery.tasks.some((task) =>
     typeof task.title !== 'string' ||
@@ -253,8 +941,53 @@ function validateSnapshot(snapshot, userId) {
     task.assignee.length > 120 ||
     (task.dueDate != null && !isValidDateTime(task.dueDate)) ||
     typeof task.isComplete !== 'boolean' ||
-    !['Low', 'Normal', 'High'].includes(task.priority))) {
+    !['Low', 'Normal', 'High'].includes(task.priority) ||
+    !Array.isArray(task.dependsOnTaskIds) ||
+    task.dependsOnTaskIds.some((id) =>
+      typeof id !== 'string' || id === task.id) ||
+    new Set(task.dependsOnTaskIds).size !== task.dependsOnTaskIds.length)) {
     throw new HttpError(400, 'invalid_task');
+  }
+  const tasksById = new Map(
+    snapshot.delivery.tasks.map((task) => [task.id, task]),
+  );
+  for (const task of snapshot.delivery.tasks) {
+    if (task.dependsOnTaskIds.some((dependencyId) => {
+      const dependency = tasksById.get(dependencyId);
+      return !dependency || dependency.projectId !== task.projectId;
+    })) {
+      throw new HttpError(400, 'invalid_task_dependency');
+    }
+  }
+  const dependentTaskIds = new Map(
+    [...tasksById.keys()].map((taskId) => [taskId, []]),
+  );
+  const dependencyCounts = new Map(
+    snapshot.delivery.tasks.map((task) => [
+      task.id,
+      task.dependsOnTaskIds.length,
+    ]),
+  );
+  for (const task of snapshot.delivery.tasks) {
+    for (const dependencyId of task.dependsOnTaskIds) {
+      dependentTaskIds.get(dependencyId).push(task.id);
+    }
+  }
+  const tasksWithoutDependencies = [...dependencyCounts.entries()]
+    .filter(([, count]) => count === 0)
+    .map(([taskId]) => taskId);
+  let orderedTaskCount = 0;
+  while (tasksWithoutDependencies.length > 0) {
+    const taskId = tasksWithoutDependencies.pop();
+    orderedTaskCount += 1;
+    for (const dependentTaskId of dependentTaskIds.get(taskId)) {
+      const count = dependencyCounts.get(dependentTaskId) - 1;
+      dependencyCounts.set(dependentTaskId, count);
+      if (count === 0) tasksWithoutDependencies.push(dependentTaskId);
+    }
+  }
+  if (orderedTaskCount !== tasksById.size) {
+    throw new HttpError(400, 'task_dependency_cycle');
   }
   if (snapshot.delivery.milestones.some((item) =>
     typeof item.title !== 'string' ||
@@ -264,7 +997,11 @@ function validateSnapshot(snapshot, userId) {
     !['Not started', 'In progress', 'Complete'].includes(item.status) ||
     typeof item.update !== 'string' ||
     item.update.length > 1000 ||
-    !isValidDateTime(item.updatedAt))) {
+    !isValidDateTime(item.updatedAt) ||
+    (item.phaseId != null && !phaseIds.has(item.phaseId)) ||
+    (item.phaseId != null &&
+      phases.find((phase) => phase.id === item.phaseId)?.projectId !==
+        item.projectId))) {
     throw new HttpError(400, 'invalid_milestone');
   }
   if (snapshot.delivery.punchItems.some((item) =>
@@ -343,6 +1080,7 @@ function validateSnapshot(snapshot, userId) {
     projectIds.has(record.projectId);
   if (projects.some((project) =>
     (project.customerId != null && !customerIds.has(project.customerId))) ||
+      phases.some((phase) => !validProject(phase)) ||
       snapshot.activities.some((activity) =>
         activity.customerId != null && !customerIds.has(activity.customerId)) ||
       snapshot.communications.some((entry) =>
@@ -376,6 +1114,51 @@ function validateSnapshot(snapshot, userId) {
     'Failed',
     'Received',
   ]);
+  const procurementRecordCollections = new Map([
+    ['requisition', snapshot.delivery.requisitions],
+    ['rfq', snapshot.delivery.rfqs],
+    ['quote', snapshot.delivery.vendorQuotes],
+    ['purchaseOrder', snapshot.delivery.purchaseOrders],
+  ]);
+  const vendorIds = new Set(
+    snapshot.delivery.vendors.map((vendor) => vendor.id),
+  );
+  const communicationProcurementLinkIsValid = (entry) => {
+    if (entry.vendorId == null &&
+        entry.procurementRecordType == null &&
+        entry.procurementRecordId == null) {
+      return true;
+    }
+    if (entry.vendorId != null &&
+        (typeof entry.vendorId !== 'string' ||
+          !vendorIds.has(entry.vendorId))) {
+      return false;
+    }
+    if (entry.procurementRecordType == null &&
+        entry.procurementRecordId == null) {
+      return true;
+    }
+    if (typeof entry.procurementRecordType !== 'string' ||
+        typeof entry.procurementRecordId !== 'string' ||
+        entry.procurementRecordId.length > 160) {
+      return false;
+    }
+    const records = procurementRecordCollections.get(
+      entry.procurementRecordType,
+    );
+    const related = records?.find((record) =>
+      record.id === entry.procurementRecordId);
+    if (!related || entry.projectId !== related.projectId) return false;
+    if (entry.vendorId == null) return true;
+    if (entry.procurementRecordType === 'rfq') {
+      return related.vendorIds.includes(entry.vendorId);
+    }
+    if (entry.procurementRecordType === 'quote' ||
+        entry.procurementRecordType === 'purchaseOrder') {
+      return related.vendorId === entry.vendorId;
+    }
+    return false;
+  };
   if (snapshot.communications.some((entry) =>
     typeof entry.clientName !== 'string' ||
     entry.clientName.length > 120 ||
@@ -405,6 +1188,7 @@ function validateSnapshot(snapshot, userId) {
     !Array.isArray(entry.readByPersonaIds) ||
     entry.readByPersonaIds.some((id) => !personaIds.has(id)) ||
     new Set(entry.readByPersonaIds).size !== entry.readByPersonaIds.length ||
+    !communicationProcurementLinkIsValid(entry) ||
     (entry.channel === 'Email' &&
       entry.status !== 'Logged' &&
       !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(entry.recipient)) ||
@@ -417,7 +1201,12 @@ function validateSnapshot(snapshot, userId) {
   }
   if (snapshot.delivery.assets.some((asset) =>
     typeof asset.storagePath !== 'string' ||
-    asset.storagePath !== `${userId}/${asset.projectId}/${asset.id}` ||
+    !isAllowedProjectAssetPath(
+      asset,
+      userId,
+      workspaceId,
+      previousSnapshot,
+    ) ||
     !/^[A-Za-z0-9._-]{1,160}$/.test(asset.projectId) ||
     !/^[A-Za-z0-9._-]{1,160}$/.test(asset.id) ||
     typeof asset.dataBase64 === 'string' && asset.dataBase64.length > 0 ||
@@ -442,6 +1231,21 @@ function validateSnapshot(snapshot, userId) {
     0,
   ) > 2 * 1048576) {
     throw new HttpError(400, 'project_storage_limit_exceeded');
+  }
+
+  function isAllowedProjectAssetPath(asset, userId, workspaceId, previousSnapshot) {
+    const expectedSuffix = `${asset.projectId}/${asset.id}`;
+    if (workspaceId && asset.storagePath === `${workspaceId}/${expectedSuffix}`) {
+      return true;
+    }
+    if (!previousSnapshot &&
+        asset.storagePath === `${userId}/${expectedSuffix}`) {
+      return true;
+    }
+    return previousSnapshot?.delivery?.assets?.some((previous) =>
+      previous.id === asset.id &&
+      previous.projectId === asset.projectId &&
+      previous.storagePath === asset.storagePath) === true;
   }
 
   const quotationIds = new Set(
@@ -696,6 +1500,7 @@ function validateSnapshot(snapshot, userId) {
         snapshot.financials.templates.length) {
     throw new HttpError(400, 'invalid_financial_templates');
   }
+  validateProcurementSnapshot(snapshot, HttpError);
   return snapshot;
 }
 
@@ -705,7 +1510,7 @@ function flattenSnapshot(snapshot) {
     const values = parent === 'customers' || parent === 'activities' ||
         parent === 'personas' || parent === 'communications'
       ? snapshot[parent]
-      : snapshot[parent][field];
+      : snapshot[parent]?.[field] || [];
     for (const value of values) {
       records.push({ collection, recordId: value.id, data: value });
     }
@@ -722,7 +1527,7 @@ function flattenSnapshot(snapshot) {
 
 function unflattenSnapshot(settings, records) {
   const snapshot = {
-    schemaVersion: 4,
+    schemaVersion: 5,
     customers: [],
     pipelineStages: [],
     activities: [],
@@ -730,8 +1535,15 @@ function unflattenSnapshot(settings, records) {
     preferences: settings.preferences,
     delivery: {
       projects: [],
+      phases: [],
       tasks: [],
       milestones: [],
+      materials: [],
+      vendors: [],
+      requisitions: [],
+      rfqs: [],
+      vendorQuotes: [],
+      purchaseOrders: [],
       punchItems: [],
       assets: [],
       workLogs: [],
@@ -765,26 +1577,73 @@ function unflattenSnapshot(settings, records) {
   return snapshot;
 }
 
-function mergeSnapshotChanges(snapshot, changes) {
+function mergeSnapshotChanges(snapshot, changes, access) {
   if (!isRecord(changes) || Object.keys(changes).length === 0) {
     throw new HttpError(400, 'invalid_workspace_changes');
   }
   const merged = JSON.parse(JSON.stringify(snapshot));
   const changedCollections = new Set();
+  const changedSettings = new Set();
   let settingsChanged = false;
-  for (const [path, value] of Object.entries(changes)) {
+  for (const [path, rawValue] of Object.entries(changes)) {
+    let value = rawValue;
     if (!changePathCollections.has(path)) {
       throw new HttpError(400, 'invalid_workspace_changes');
     }
     if (path === 'preferences') {
       merged.preferences = value;
+      changedSettings.add('preferences');
       settingsChanged = true;
       continue;
     }
     if (path === 'financials.settings') {
       merged.financials.settings = value;
+      changedSettings.add('financialSettings');
       settingsChanged = true;
       continue;
+    }
+    const collection = changePathCollections.get(path);
+    const permission = collectionWritePermissions.get(collection);
+    const projectPermissions =
+      projectCollectionWritePermissions.get(collection);
+    const canManageOrganizationWide = permission &&
+      hasAnyPermission(access, [
+        permission,
+        ...(collectionWritePermissionAliases.get(collection) || []),
+      ]);
+    if (!canManageOrganizationWide && projectPermissions) {
+      if (!Array.isArray(value)) {
+        throw new HttpError(400, 'invalid_workspace_changes');
+      }
+      value = mergeProjectScopedCollection(
+        getSnapshotCollection(merged, collection),
+        value,
+        collection,
+        access,
+      );
+    }
+    if (collection === 'projects' && Array.isArray(value)) {
+      const existingProjects = new Map(
+        getSnapshotCollection(merged, 'projects')
+          .map((project) => [project.id, project]),
+      );
+      value = value.map((project) => {
+        if (!isRecord(project)) return project;
+        const existing = existingProjects.get(project.id);
+        const assignedPermissions =
+          access.projectPermissions.get(project.id) || [];
+        const canManageBudget = hasAnyPermission(access, [
+          'manageFinancials',
+          'finance.manage',
+        ]) || assignedPermissions.some((permission) =>
+          ['manageFinancials', 'finance.manage'].includes(permission));
+        if (canManageBudget) return project;
+        if (project.budget != null &&
+            project.budget !== (existing?.budget ?? null)) {
+          throw new WorkspaceAccessError(403, 'permission_denied');
+        }
+        return { ...project, budget: existing?.budget ?? null };
+      });
     }
     if (path === 'pipelineStages') {
       merged.pipelineStages = value;
@@ -796,7 +1655,140 @@ function mergeSnapshotChanges(snapshot, changes) {
     }
     changedCollections.add(changePathCollections.get(path));
   }
-  return { snapshot: merged, changedCollections, settingsChanged };
+  return {
+    snapshot: merged,
+    changedCollections,
+    changedSettings,
+    settingsChanged,
+  };
+}
+
+function hasAnyPermission(access, permissions) {
+  return permissions.some((permission) => hasPermission(access, permission));
+}
+
+function mergeProjectScopedCollection(
+  existingRecords,
+  incomingRecords,
+  collection,
+  access,
+) {
+  const permissions = projectCollectionWritePermissions.get(collection) || [];
+  const writableProjectIds = new Set(
+    [...access.projectPermissions.entries()]
+      .filter(([, projectPermissions]) =>
+        permissions.some((permission) =>
+          projectPermissions.includes(permission)) ||
+        projectPermissions.includes('projects.manage'))
+      .map(([projectId]) => projectId),
+  );
+  const projectIdFor = (record) =>
+    collection === 'projects' ? record.id : record.projectId;
+  const existingById = new Map(
+    existingRecords.map((record) => [record.id, record]),
+  );
+  const incomingById = new Map(
+    incomingRecords.map((record) => [record.id, record]),
+  );
+  for (const record of incomingRecords) {
+    const previous = existingById.get(record.id);
+    const projectId = projectIdFor(record);
+    const changed = !previous ||
+      JSON.stringify(previous) !== JSON.stringify(record);
+    if (changed &&
+        (!writableProjectIds.has(projectId) ||
+          previous &&
+            !writableProjectIds.has(projectIdFor(previous)))) {
+      throw new WorkspaceAccessError(403, 'permission_denied');
+    }
+  }
+  const preservedRecords = existingRecords.filter((record) =>
+    !writableProjectIds.has(projectIdFor(record)));
+  return [
+    ...preservedRecords,
+    ...[...incomingById.values()].filter((record) =>
+      writableProjectIds.has(projectIdFor(record))),
+  ];
+}
+
+function getSnapshotCollection(snapshot, collection) {
+  if (collection === 'customers' || collection === 'activities' ||
+      collection === 'personas' || collection === 'communications') {
+    return snapshot[collection];
+  }
+  if (collection === 'pipelineStages') {
+    return snapshot.pipelineStages.map((name, position) => ({
+      id: `stage-${String(position).padStart(5, '0')}`,
+      name,
+      position,
+    }));
+  }
+  const field = collectionFields.get(collection);
+  return field ? snapshot[field[0]][field[1]] : [];
+}
+
+function assertProjectScopedChanges(
+  access,
+  collection,
+  previousRecords,
+  nextRecords,
+) {
+  const acceptedPermissions =
+    projectCollectionWritePermissions.get(collection);
+  if (!acceptedPermissions) {
+    throw new WorkspaceAccessError(403, 'permission_denied');
+  }
+  const previousById = new Map(
+    previousRecords.map((record) => [record.id, record]),
+  );
+  const nextById = new Map(nextRecords.map((record) => [record.id, record]));
+  const changedIds = new Set([
+    ...previousById.keys(),
+    ...nextById.keys(),
+  ]);
+  for (const id of changedIds) {
+    const previous = previousById.get(id);
+    const next = nextById.get(id);
+    if (JSON.stringify(previous) === JSON.stringify(next)) continue;
+    const projectIds = new Set([
+      ...(previous ? [collection === 'projects'
+        ? previous.id
+        : previous.projectId] : []),
+      ...(next ? [collection === 'projects' ? next.id : next.projectId] : []),
+    ]);
+    for (const projectId of projectIds) {
+      const permissions = access.projectPermissions.get(projectId) || [];
+      if (!acceptedPermissions.some((permission) =>
+        permissions.includes(permission)) &&
+          !permissions.includes('projects.manage')) {
+        throw new WorkspaceAccessError(403, 'permission_denied');
+      }
+    }
+  }
+}
+
+function assertWorkspaceChangePermissions(access, current, changes) {
+  if (changes.changedSettings.has('preferences') &&
+      !hasPermission(access, 'configureWorkspace')) {
+    throw new WorkspaceAccessError(403, 'permission_denied');
+  }
+  if (changes.changedSettings.has('financialSettings') &&
+      !hasPermission(access, 'manageFinancials')) {
+    throw new WorkspaceAccessError(403, 'permission_denied');
+  }
+  for (const collection of changes.changedCollections) {
+    const permission = collectionWritePermissions.get(collection);
+    if (permission && hasAnyPermission(access, [
+      permission,
+      ...(collectionWritePermissionAliases.get(collection) || []),
+    ])) continue;
+    assertProjectScopedChanges(
+      access,
+      collection,
+      getSnapshotCollection(current, collection),
+      getSnapshotCollection(changes.snapshot, collection),
+    );
+  }
 }
 
 async function syncCoreTables(client, workspaceId, snapshot, collections) {
@@ -885,14 +1877,16 @@ async function syncCoreTables(client, workspaceId, snapshot, collections) {
       await client.query(
         `INSERT INTO studio_projects
            (workspace_id, id, name, location, status, customer_id,
-            target_date, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::date, now())
+              target_date, start_date, budget, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7::date, $8::date, $9, now())
          ON CONFLICT (workspace_id, id) DO UPDATE SET
            name = EXCLUDED.name,
            location = EXCLUDED.location,
            status = EXCLUDED.status,
            customer_id = EXCLUDED.customer_id,
            target_date = EXCLUDED.target_date,
+             start_date = EXCLUDED.start_date,
+             budget = EXCLUDED.budget,
            updated_at = now()`,
         [
           workspaceId,
@@ -902,6 +1896,8 @@ async function syncCoreTables(client, workspaceId, snapshot, collections) {
           project.status,
           project.customerId,
           project.targetDate,
+          project.startDate,
+          project.budget,
         ],
       );
     }
@@ -1023,6 +2019,31 @@ async function syncCoreTables(client, workspaceId, snapshot, collections) {
 async function syncDeliveryTables(client, workspaceId, snapshot, collections) {
   const operations = [
     {
+      collection: 'phases',
+      records: snapshot.delivery.phases,
+      table: 'project_phases',
+      insert: `INSERT INTO project_phases
+        (workspace_id, id, project_id, name, position, status, start_date, end_date)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::date, $8::date)
+       ON CONFLICT (workspace_id, id) DO UPDATE SET
+         project_id = EXCLUDED.project_id,
+         name = EXCLUDED.name,
+         position = EXCLUDED.position,
+         status = EXCLUDED.status,
+         start_date = EXCLUDED.start_date,
+         end_date = EXCLUDED.end_date`,
+      values: (phase) => [
+        workspaceId,
+        phase.id,
+        phase.projectId,
+        phase.name,
+        phase.position,
+        phase.status,
+        phase.startDate,
+        phase.endDate,
+      ],
+    },
+    {
       collection: 'tasks',
       records: snapshot.delivery.tasks,
       table: 'project_tasks',
@@ -1055,15 +2076,16 @@ async function syncDeliveryTables(client, workspaceId, snapshot, collections) {
       table: 'project_milestones',
       insert: `INSERT INTO project_milestones
         (workspace_id, id, project_id, title, due_date, status, update_note,
-         updated_at)
-       VALUES ($1, $2, $3, $4, $5::date, $6, $7, $8::timestamptz)
+         updated_at, phase_id)
+       VALUES ($1, $2, $3, $4, $5::date, $6, $7, $8::timestamptz, $9)
        ON CONFLICT (workspace_id, id) DO UPDATE SET
          project_id = EXCLUDED.project_id,
          title = EXCLUDED.title,
          due_date = EXCLUDED.due_date,
          status = EXCLUDED.status,
          update_note = EXCLUDED.update_note,
-         updated_at = EXCLUDED.updated_at`,
+         updated_at = EXCLUDED.updated_at,
+         phase_id = EXCLUDED.phase_id`,
       values: (item) => [
         workspaceId,
         item.id,
@@ -1073,6 +2095,7 @@ async function syncDeliveryTables(client, workspaceId, snapshot, collections) {
         item.status,
         item.update,
         item.updatedAt,
+        item.phaseId,
       ],
     },
     {
@@ -1200,6 +2223,158 @@ async function syncDeliveryTables(client, workspaceId, snapshot, collections) {
       `DELETE FROM ${operation.table}
        WHERE workspace_id = $1 AND NOT (id = ANY($2::text[]))`,
       [workspaceId, operation.records.map((record) => record.id)],
+    );
+  }
+  if (collections.has('tasks')) {
+    await client.query(
+      'DELETE FROM project_task_dependencies WHERE workspace_id = $1',
+      [workspaceId],
+    );
+    for (const task of snapshot.delivery.tasks) {
+      for (const dependsOnTaskId of task.dependsOnTaskIds) {
+        await client.query(
+          `INSERT INTO project_task_dependencies
+             (workspace_id, project_id, task_id, depends_on_task_id)
+           VALUES ($1, $2, $3, $4)`,
+          [workspaceId, task.projectId, task.id, dependsOnTaskId],
+        );
+      }
+    }
+  }
+}
+
+function changedRecordEvents(previousRecords, nextRecords, collection) {
+  const previousById = new Map(
+    (previousRecords || []).map((record) => [record.id, record]),
+  );
+  const nextById = new Map(
+    (nextRecords || []).map((record) => [record.id, record]),
+  );
+  const events = [];
+  for (const id of new Set([...previousById.keys(), ...nextById.keys()])) {
+    const previous = previousById.get(id);
+    const next = nextById.get(id);
+    if (stableStringify(previous) === stableStringify(next)) continue;
+    events.push({
+      projectId: next?.projectId ?? previous?.projectId,
+      collection,
+      recordId: id,
+      action: !previous
+        ? 'created'
+        : !next
+          ? 'deleted'
+          : 'updated',
+      details: {},
+    });
+  }
+  return events;
+}
+
+async function insertSiteExecutionAuditEvents(
+  client,
+  workspaceId,
+  userId,
+  previousSnapshot,
+  nextSnapshot,
+) {
+  const collections = [
+    'goodsReceipts',
+    'stockMovements',
+    'workOrders',
+    'dailyReports',
+    'siteInspections',
+  ];
+  for (const collection of collections) {
+    const events = changedRecordEvents(
+      previousSnapshot?.delivery?.[collection] || [],
+      nextSnapshot.delivery[collection] || [],
+      collection,
+    );
+    for (const event of events) {
+      if (typeof event.projectId !== 'string') continue;
+      await client.query(
+        `INSERT INTO site_execution_audit_events
+           (workspace_id, project_id, collection, record_id, action,
+            actor_user_id, details)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+        [
+          workspaceId,
+          event.projectId,
+          event.collection,
+          event.recordId,
+          event.action,
+          userId,
+          JSON.stringify(event.details),
+        ],
+      );
+    }
+  }
+}
+
+async function insertWorkforceAuditEvents(
+  client,
+  workspaceId,
+  userId,
+  previousSnapshot,
+  nextSnapshot,
+) {
+  const collections = [
+    'workers',
+    'workforceAllocations',
+    'siteAttendance',
+  ];
+  for (const collection of collections) {
+    const events = changedRecordEvents(
+      previousSnapshot?.delivery?.[collection] || [],
+      nextSnapshot.delivery[collection] || [],
+      collection,
+    );
+    for (const event of events) {
+      await client.query(
+        `INSERT INTO workforce_audit_events
+           (workspace_id, project_id, worker_id, action,
+            actor_user_id, details)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+        [
+          workspaceId,
+          event.projectId ?? null,
+          collection === 'workers'
+            ? event.recordId
+            : (nextSnapshot.delivery[collection]?.find(
+                (record) => record.id === event.recordId,
+              )?.workerId ?? null),
+          `${collection}_${event.action}`,
+          userId,
+          JSON.stringify(event.details),
+        ],
+      );
+    }
+  }
+}
+
+async function insertProcurementAuditEvents(
+  client,
+  workspaceId,
+  userId,
+  events,
+) {
+  for (const event of events) {
+    await client.query(
+      `INSERT INTO procurement_audit_events
+         (workspace_id, project_id, collection, record_id, action,
+          actor_user_id, from_status, to_status, details)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
+      [
+        workspaceId,
+        event.projectId,
+        event.collection,
+        event.recordId,
+        event.action,
+        userId,
+        event.fromStatus,
+        event.toStatus,
+        JSON.stringify(event.details),
+      ],
     );
   }
 }
@@ -1473,30 +2648,22 @@ async function saveWorkspace(
   changedCollections = null,
   settingsChanged = true,
 ) {
+  const context = await client.query(
+    `SELECT NULLIF(current_setting('app.workspace_id', true), '')::uuid
+       AS workspace_id`,
+  );
+  const workspaceId = context.rows[0]?.workspace_id;
+  if (!workspaceId) {
+    throw new WorkspaceAccessError(400, 'workspace_required');
+  }
   const workspace = await client.query(
-    `INSERT INTO workspaces (owner_user_id, name)
-     VALUES ($1, $2)
-     ON CONFLICT (owner_user_id) DO UPDATE
-       SET name = EXCLUDED.name, updated_at = now()
-     RETURNING id`,
-    [userId, snapshot.preferences.studioName],
+    `UPDATE workspaces SET name = $2, updated_at = now()
+     WHERE id = $1 RETURNING owner_user_id`,
+    [workspaceId, snapshot.preferences.studioName],
   );
-  const workspaceId = workspace.rows[0].id;
-  await client.query(
-    `INSERT INTO workspace_owner_profiles
-       (workspace_id, owner_user_id, display_name, email)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (workspace_id) DO UPDATE
-       SET display_name = EXCLUDED.display_name,
-           email = EXCLUDED.email,
-           updated_at = now()`,
-    [
-      workspaceId,
-      userId,
-      profile.displayName || 'Studio owner',
-      profile.email || null,
-    ],
-  );
+  if (workspace.rowCount !== 1) {
+    throw new WorkspaceAccessError(404, 'workspace_not_found');
+  }
   const current = await client.query(
     `SELECT revision, data FROM workspace_settings
      WHERE workspace_id = $1 FOR UPDATE`,
@@ -1581,6 +2748,7 @@ async function saveWorkspace(
     ...(fullSave ? [
       'customers',
       'projects',
+      'phases',
       'tasks',
       'milestones',
       'punchItems',
@@ -1628,8 +2796,8 @@ async function loadWorkspace(client, userId) {
     `SELECT w.id, s.data, s.revision
      FROM workspaces w
      LEFT JOIN workspace_settings s ON s.workspace_id = w.id
-     WHERE w.owner_user_id = $1`,
-    [userId],
+     WHERE w.id =
+       NULLIF(current_setting('app.workspace_id', true), '')::uuid`,
   );
   if (result.rows.length === 0) return { revision: 0, snapshot: null };
   const row = result.rows[0];
@@ -1657,11 +2825,37 @@ function getQueryValue(req, key) {
   return url.searchParams.get(key);
 }
 
-async function loadCollection(client, userId, req) {
+function getCollectionProjectScope(access, collection) {
+  if (hasPermission(access, 'workspace.read')) return null;
+  if (collection === 'preferences' || collection === 'pipelineStages') {
+    return null;
+  }
+  const globalPermissions = collectionReadPermissions.get(collection) || [];
+  if (globalPermissions.some((permission) =>
+    hasPermission(access, permission))) {
+    return null;
+  }
+  const projectPermissions =
+    projectCollectionReadPermissions.get(collection);
+  if (!projectPermissions) {
+    throw new WorkspaceAccessError(403, 'permission_denied');
+  }
+  const projectIds = [...access.projectPermissions.entries()]
+    .filter(([, permissions]) => projectPermissions.some((permission) =>
+      permissions.includes(permission)))
+    .map(([projectId]) => projectId);
+  if (projectIds.length === 0) {
+    throw new WorkspaceAccessError(403, 'permission_denied');
+  }
+  return projectIds;
+}
+
+async function loadCollection(client, userId, req, access) {
   const collection = getQueryValue(req, 'collection');
   if (!collection || !collectionNames.has(collection)) {
     throw new HttpError(400, 'invalid_collection');
   }
+  const projectScope = getCollectionProjectScope(access, collection);
   const limitValue = getQueryValue(req, 'limit');
   const offsetValue = getQueryValue(req, 'offset');
   const search = getQueryValue(req, 'search')?.trim() || null;
@@ -1677,8 +2871,8 @@ async function loadCollection(client, userId, req) {
     `SELECT w.id, s.revision
      FROM workspaces w
      LEFT JOIN workspace_settings s ON s.workspace_id = w.id
-     WHERE w.owner_user_id = $1`,
-    [userId],
+     WHERE w.id =
+       NULLIF(current_setting('app.workspace_id', true), '')::uuid`,
   );
   if (workspaceResult.rows.length === 0) {
     return {
@@ -1694,6 +2888,50 @@ async function loadCollection(client, userId, req) {
   const workspaceRevision = workspaceResult.rows[0].revision;
   const workspaceExists = workspaceRevision != null;
   const revision = Number(workspaceRevision || 0);
+  if (collection === 'procurementAudit') {
+    if (projectScope !== null &&
+        projectScope.length === 0) {
+      throw new WorkspaceAccessError(403, 'permission_denied');
+    }
+    const count = await client.query(
+      `SELECT count(*)::integer AS total
+       FROM procurement_audit_events
+       WHERE workspace_id = $1
+         AND ($2::text[] IS NULL OR project_id = ANY($2::text[]))
+         AND (
+           $3::text IS NULL OR
+           position(lower($3) in lower(collection || ' ' || record_id || ' ' || action)) > 0
+         )`,
+      [workspaceId, projectScope, search],
+    );
+    const result = await client.query(
+      `SELECT id, project_id AS "projectId", collection,
+              record_id AS "recordId", action, actor_user_id AS "actorUserId",
+              from_status AS "fromStatus", to_status AS "toStatus",
+              details, created_at AS "createdAt"
+       FROM procurement_audit_events
+       WHERE workspace_id = $1
+         AND ($2::text[] IS NULL OR project_id = ANY($2::text[]))
+         AND (
+           $3::text IS NULL OR
+           position(lower($3) in lower(collection || ' ' || record_id || ' ' || action)) > 0
+         )
+       ORDER BY created_at DESC, id DESC
+       LIMIT $4 OFFSET $5`,
+      [workspaceId, projectScope, search, limit, offset],
+    );
+    const total = count.rows[0].total;
+    return {
+      collection,
+      records: result.rows,
+      total,
+      nextOffset: offset + result.rows.length < total
+        ? offset + result.rows.length
+        : null,
+      revision,
+      workspaceExists,
+    };
+  }
   if (collection === 'invoicePayments') {
     const count = await client.query(
       `SELECT count(*)::integer AS total
@@ -1701,11 +2939,12 @@ async function loadCollection(client, userId, req) {
        JOIN finance_documents d
          ON d.workspace_id = p.workspace_id AND d.id = p.invoice_id
        WHERE p.workspace_id = $1
+         AND ($2::text[] IS NULL OR d.project_id = ANY($2::text[]))
          AND (
-           $2::text IS NULL OR
-           position(lower($2) in lower(d.number || ' ' || p.invoice_id)) > 0
+           $3::text IS NULL OR
+           position(lower($3) in lower(d.number || ' ' || p.invoice_id)) > 0
          )`,
-      [workspaceId, search],
+      [workspaceId, projectScope, search],
     );
     const result = await client.query(
       `SELECT p.id,
@@ -1718,13 +2957,14 @@ async function loadCollection(client, userId, req) {
        JOIN finance_documents d
          ON d.workspace_id = p.workspace_id AND d.id = p.invoice_id
        WHERE p.workspace_id = $1
+         AND ($2::text[] IS NULL OR d.project_id = ANY($2::text[]))
          AND (
-           $2::text IS NULL OR
-           position(lower($2) in lower(d.number || ' ' || p.invoice_id)) > 0
+           $3::text IS NULL OR
+           position(lower($3) in lower(d.number || ' ' || p.invoice_id)) > 0
          )
        ORDER BY p.recorded_at DESC, p.id
-       LIMIT $3 OFFSET $4`,
-      [workspaceId, search, limit, offset],
+       LIMIT $4 OFFSET $5`,
+      [workspaceId, projectScope, search, limit, offset],
     );
     const total = count.rows[0].total;
     return {
@@ -1757,6 +2997,64 @@ async function loadCollection(client, userId, req) {
     };
   }
 
+  const parameters = [workspaceId, collection, search];
+  let projectCondition = '';
+  const canViewProjectBudgets = hasPermission(access, 'workspace.read') ||
+    hasAnyPermission(access, [
+      'viewFinancials',
+      'manageFinancials',
+      'finance.view',
+      'finance.manage',
+    ]) ||
+    projectScope !== null && projectScope.every((projectId) => {
+      const permissions = access.projectPermissions.get(projectId) || [];
+      return permissions.some((permission) =>
+        ['viewFinancials', 'manageFinancials', 'finance.view', 'finance.manage']
+          .includes(permission));
+    });
+  const dataExpression = projectScope !== null && collection === 'customers'
+    ? `jsonb_set(
+         jsonb_set(
+           jsonb_set(
+             jsonb_set(data - 'requirement', '{value}', '"Restricted"'::jsonb),
+             '{email}', '""'::jsonb
+           ),
+           '{phone}', '""'::jsonb
+         ),
+         '{notes}', '""'::jsonb
+       )`
+    : collection === 'projects' &&
+        !canViewProjectBudgets
+      ? `jsonb_set(data, '{budget}', 'null'::jsonb)`
+      : 'data';
+  if (projectScope !== null) {
+    let customerIds = [];
+    if (collection === 'customers') {
+      const customerResult = await client.query(
+        `SELECT DISTINCT data->>'customerId' AS customer_id
+         FROM workspace_records
+         WHERE workspace_id = $1 AND collection = 'projects'
+           AND data->>'id' = ANY($2::text[])
+           AND data->>'customerId' IS NOT NULL`,
+        [workspaceId, projectScope],
+      );
+      customerIds = customerResult.rows.map((row) => row.customer_id);
+    }
+    parameters.push(projectScope);
+    const projectParameter = `$${parameters.length}::text[]`;
+    if (collection === 'projects') {
+      projectCondition = `AND data->>'id' = ANY(${projectParameter})`;
+    } else if (collection === 'customers') {
+      parameters.push(customerIds);
+      projectCondition =
+        `AND data->>'id' = ANY($${parameters.length}::text[])`;
+    } else if (collection === 'communications') {
+      projectCondition = `AND data->>'projectId' = ANY(${projectParameter})`;
+    } else {
+      projectCondition =
+        `AND data->>'projectId' = ANY(${projectParameter})`;
+    }
+  }
   const count = await client.query(
     `SELECT count(*)::integer AS total
      FROM workspace_records
@@ -1764,22 +3062,31 @@ async function loadCollection(client, userId, req) {
        AND collection = $2
        AND (
          $3::text IS NULL OR
-         position(lower($3) in lower(data::text)) > 0
-       )`,
-    [workspaceId, collection, search],
+         position(lower($3) in lower(${dataExpression}::text)) > 0
+       )
+       ${projectCondition}`,
+    parameters,
   );
+  const resultParameters = [
+    ...parameters,
+    limit,
+    offset,
+  ];
+  const limitParameter = resultParameters.length - 1;
+  const offsetParameter = resultParameters.length;
   const result = await client.query(
-    `SELECT data
+    `SELECT ${dataExpression} AS data
      FROM workspace_records
      WHERE workspace_id = $1
        AND collection = $2
        AND (
          $3::text IS NULL OR
-         position(lower($3) in lower(data::text)) > 0
+         position(lower($3) in lower(${dataExpression}::text)) > 0
        )
+       ${projectCondition}
      ORDER BY record_id
-     LIMIT $4 OFFSET $5`,
-    [workspaceId, collection, search, limit, offset],
+     LIMIT $${limitParameter} OFFSET $${offsetParameter}`,
+    resultParameters,
   );
   const total = count.rows[0].total;
   const nextOffset = offset + result.rows.length < total
@@ -1797,7 +3104,7 @@ async function loadCollection(client, userId, req) {
 
 function createWorkspaceHandler({
   authenticate = authenticateRequest,
-  withTransaction = withUserTransaction,
+  withWorkspace = withWorkspaceTransaction,
   rateLimit = null,
   logger = console.error,
 } = {}) {
@@ -1822,13 +3129,18 @@ function createWorkspaceHandler({
           },
         );
       }
+      const workspaceId = getWorkspaceId(req);
       if (req.method === 'GET') {
-        const result = await withTransaction(
+        const result = await withWorkspace(
           userId,
-          (client) =>
-            getQueryValue(req, 'collection') === null
-              ? loadWorkspace(client, userId)
-              : loadCollection(client, userId, req),
+          workspaceId,
+          (client, access) => {
+            if (getQueryValue(req, 'collection') === null) {
+              requirePermission(access, 'workspace.read');
+              return loadWorkspace(client, userId);
+            }
+            return loadCollection(client, userId, req, access);
+          },
         );
         return res.status(200).json(result);
       }
@@ -1842,43 +3154,122 @@ function createWorkspaceHandler({
           req.body.revision < 0) {
         throw new HttpError(400, 'invalid_workspace_revision');
       }
-      const revision = await withTransaction(userId, async (client) => {
-        if (req.method === 'PUT') {
-          const snapshot = validateSnapshot(req.body.snapshot, userId);
+      const revision = await withWorkspace(
+        userId,
+        workspaceId,
+        async (client, access) => {
+          if (req.method === 'PUT') {
+            if (!access.permissions.includes('*')) {
+              throw new WorkspaceAccessError(403, 'permission_denied');
+            }
+            const current = await loadWorkspace(client, userId);
+            const snapshot = validateSnapshot(
+              req.body.snapshot,
+              userId,
+              workspaceId,
+              current.snapshot,
+            );
+            const procurementEvents = validateProcurementTransitions(
+              current.snapshot,
+              snapshot,
+              access,
+              hasPermission,
+              HttpError,
+              WorkspaceAccessError,
+            );
+            await insertProcurementAuditEvents(
+              client,
+              workspaceId,
+              userId,
+              procurementEvents,
+            );
+            await insertSiteExecutionAuditEvents(
+              client,
+              workspaceId,
+              userId,
+              current.snapshot,
+              snapshot,
+            );
+            await insertWorkforceAuditEvents(
+              client,
+              workspaceId,
+              userId,
+              current.snapshot,
+              snapshot,
+            );
+            await insertSiteExecutionAuditEvents(
+              client,
+              workspaceId,
+              userId,
+              current.snapshot,
+              snapshot,
+            );
+            await insertWorkforceAuditEvents(
+              client,
+              workspaceId,
+              userId,
+              current.snapshot,
+              snapshot,
+            );
+            return saveWorkspace(
+              client,
+              userId,
+              req.body.revision,
+              snapshot,
+              profile,
+            );
+          }
+
+          const current = await loadWorkspace(client, userId);
+          if (current.snapshot === null) {
+            throw new HttpError(404, 'workspace_not_found');
+          }
+          if (current.revision !== req.body.revision) {
+            throw new HttpError(409, 'workspace_revision_conflict');
+          }
+          const changes = mergeSnapshotChanges(
+            current.snapshot,
+            req.body.changes,
+            access,
+          );
+          assertWorkspaceChangePermissions(access, current.snapshot, changes);
+          const snapshot = validateSnapshot(
+            changes.snapshot,
+            userId,
+            workspaceId,
+            current.snapshot,
+          );
+          const procurementEvents = validateProcurementTransitions(
+            current.snapshot,
+            snapshot,
+            access,
+            hasPermission,
+            HttpError,
+            WorkspaceAccessError,
+          );
+          await insertProcurementAuditEvents(
+            client,
+            workspaceId,
+            userId,
+            procurementEvents,
+          );
           return saveWorkspace(
             client,
             userId,
             req.body.revision,
             snapshot,
             profile,
+            changes.changedCollections,
+            changes.settingsChanged,
           );
-        }
-
-        const current = await loadWorkspace(client, userId);
-        if (current.snapshot === null) {
-          throw new HttpError(404, 'workspace_not_found');
-        }
-        if (current.revision !== req.body.revision) {
-          throw new HttpError(409, 'workspace_revision_conflict');
-        }
-        const changes = mergeSnapshotChanges(
-          current.snapshot,
-          req.body.changes,
-        );
-        const snapshot = validateSnapshot(changes.snapshot, userId);
-        return saveWorkspace(
-          client,
-          userId,
-          req.body.revision,
-          snapshot,
-          profile,
-          changes.changedCollections,
-          changes.settingsChanged,
-        );
-      });
+        },
+      );
       return res.status(200).json({ revision });
     } catch (error) {
       if (respondToRateLimit(error, res)) return;
+      if (error instanceof WorkspaceAccessError) {
+        return res.status(error.statusCode).json({ error: error.code });
+      }
       if (error instanceof HttpError ||
           (Number.isInteger(error?.statusCode) && error.statusCode === 401)) {
         const statusCode = error.statusCode;
@@ -1912,12 +3303,20 @@ const handler = createWorkspaceHandler({
 });
 Object.assign(handler, {
   HttpError,
+  assertWorkspaceChangePermissions,
   createWorkspaceHandler,
   flattenSnapshot,
+  loadCollection,
   loadWorkspace,
+  mergeSnapshotChanges,
+  insertProcurementAuditEvents,
+  insertSiteExecutionAuditEvents,
+  insertWorkforceAuditEvents,
   saveWorkspace,
   unflattenSnapshot,
+  validateProcurementSnapshot,
   validateSnapshot,
+  validateProcurementTransitions,
 });
 
 module.exports = handler;

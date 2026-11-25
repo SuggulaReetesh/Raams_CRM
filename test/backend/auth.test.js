@@ -45,6 +45,8 @@ test('Supabase authentication verifies signature, issuer, audience, and subject'
     });
     assert.deepEqual(result, {
       userId,
+      email: null,
+      emailVerified: false,
       profile: { displayName: 'Studio owner', email: null },
     });
 

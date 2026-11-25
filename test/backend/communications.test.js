@@ -59,21 +59,27 @@ test('integration settings endpoint stores encrypted values without returning cr
   const handler = integrationsHandler.createIntegrationsHandler({
     authenticate: async () => ({ userId: 'owner-1' }),
     env: { INTEGRATION_ENCRYPTION_KEY: encryptionKey },
-    withTransaction: async (_userId, operation) => operation({
+    withWorkspace: async (_userId, _workspaceId, operation) => operation({
       query: async (sql, parameters = []) => {
         statements.push({ sql, parameters });
-        if (sql.includes('SELECT id FROM workspaces')) {
-          return { rows: [{ id: 'workspace-1' }] };
+        if (sql.includes('SELECT owner_user_id FROM workspaces')) {
+          return {
+            rowCount: 1,
+            rows: [{ owner_user_id: 'owner-1' }],
+          };
         }
-        return { rows: [] };
+        return { rowCount: 1, rows: [] };
       },
-    }),
+    }, { permissions: ['*'] }),
     logger: () => assert.fail('Unexpected integration error log.'),
   });
   const response = createResponse();
 
   await handler({
     method: 'PUT',
+    headers: {
+      'x-workspace-id': '00000000-0000-4000-8000-000000000002',
+    },
     body: {
       provider: 'postal',
       workspaceName: 'Studio',
@@ -100,7 +106,9 @@ test('integration settings endpoint stores encrypted values without returning cr
     secret_ciphertext: insert.parameters[5],
     secret_iv: insert.parameters[6],
     secret_auth_tag: insert.parameters[7],
-  }, 'owner-1:postal', { INTEGRATION_ENCRYPTION_KEY: encryptionKey });
+  }, '00000000-0000-4000-8000-000000000002:postal', {
+    INTEGRATION_ENCRYPTION_KEY: encryptionKey,
+  });
   assert.equal(storedSecrets.smtpPassword, 'top-secret');
 });
 
@@ -129,6 +137,9 @@ test('outbound API rejects malformed idempotency requests before database access
 
   await handler({
     method: 'POST',
+    headers: {
+      'x-workspace-id': '00000000-0000-4000-8000-000000000002',
+    },
     body: {
       revision: 1,
       message: {
@@ -155,7 +166,8 @@ test('outbound API returns an existing matching message without sending twice', 
   };
   const handler = communicationsHandler.createCommunicationsHandler({
     authenticate: async () => ({ userId: 'owner-1' }),
-    withTransaction: async (_userId, operation) => operation({}),
+    withWorkspace: async (_userId, _workspaceId, operation) =>
+      operation({}, { permissions: ['*'] }),
     loadWorkspaceFn: async () => ({
       snapshot: { communications: [existing] },
       revision: 4,
@@ -165,6 +177,9 @@ test('outbound API returns an existing matching message without sending twice', 
   const response = createResponse();
   await handler({
     method: 'POST',
+    headers: {
+      'x-workspace-id': '00000000-0000-4000-8000-000000000002',
+    },
     body: {
       revision: 3,
       message: { ...existing },

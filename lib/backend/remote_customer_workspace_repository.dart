@@ -6,7 +6,6 @@ import 'package:raams_crm/communication.dart';
 import 'package:raams_crm/customer.dart';
 import 'package:raams_crm/delivery.dart';
 import 'package:raams_crm/finance.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
 
 typedef AccessTokenProvider = Future<String?> Function();
 
@@ -25,6 +24,8 @@ class WorkspaceApiException implements Exception {
       'This message ID was already used for different content.',
     409 when code == 'workspace_revision_conflict' =>
       'This workspace changed on another device. Reload before saving.',
+    409 when code == 'duplicate_line_item_name' =>
+      'A line item with this name already exists in the workspace catalog.',
     409 => 'The request conflicts with the current workspace state.',
     _ => 'Workspace request failed ($statusCode): $code',
   };
@@ -51,11 +52,13 @@ class WorkspaceCollectionPage {
 class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
   RemoteCustomerWorkspaceRepository({
     required this.baseUri,
+    required this.workspaceId,
     required this.accessTokenProvider,
     http.Client? client,
   }) : _client = client ?? http.Client();
 
   final Uri baseUri;
+  final String workspaceId;
   final AccessTokenProvider accessTokenProvider;
   final http.Client _client;
   final SharedPreferencesCustomerWorkspaceRepository _codec =
@@ -68,6 +71,7 @@ class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
   final Set<String> _pendingUploads = {};
 
   Uri get _workspaceUri => baseUri.resolve('/api/workspace');
+  Uri get _quotationCatalogUri => baseUri.resolve('/api/quotation-catalog');
 
   Future<Map<String, String>> _headers() async {
     final token = await accessTokenProvider();
@@ -78,7 +82,42 @@ class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
       'Authorization': 'Bearer $token',
       'Accept': 'application/json',
       'Content-Type': 'application/json',
+      'X-Workspace-Id': workspaceId,
     };
+  }
+
+  @override
+  Future<List<StudioLineItemCatalogEntry>> loadLineItemCatalog() async {
+    final response = await _client.get(
+      _quotationCatalogUri,
+      headers: await _headers(),
+    );
+    final body = _decodeResponse(response);
+    final catalog = body['catalog'];
+    if (catalog is! Map<String, dynamic>) {
+      throw const FormatException('The server returned an invalid catalog.');
+    }
+    final lineItems = catalog['lineItems'];
+    if (lineItems is! List<dynamic>) {
+      throw const FormatException(
+        'The server returned an invalid line-item catalog.',
+      );
+    }
+    return lineItems
+        .map(StudioLineItemCatalogEntry.fromJson)
+        .toList(growable: false);
+  }
+
+  @override
+  Future<void> saveLineItemCatalogEntry(
+    StudioLineItemCatalogEntry entry,
+  ) async {
+    final response = await _client.put(
+      _quotationCatalogUri,
+      headers: await _headers(),
+      body: jsonEncode({'type': 'lineItems', 'record': entry.toJson()}),
+    );
+    _decodeResponse(response);
   }
 
   @override
@@ -195,8 +234,15 @@ class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
       'activities',
       'personas',
       'projects',
+      'phases',
       'tasks',
       'milestones',
+      'materials',
+      'vendors',
+      'requisitions',
+      'rfqs',
+      'vendorQuotes',
+      'purchaseOrders',
       'punchItems',
       'assets',
       'workLogs',
@@ -237,13 +283,13 @@ class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
     );
     final preferences = recordsByCollection['preferences']!;
     final financialSettings = recordsByCollection['financialSettings']!;
-    if (preferences.length != 1 || financialSettings.length != 1) {
+    if (preferences.length != 1 || financialSettings.length > 1) {
       throw const FormatException(
         'The server returned incomplete workspace settings.',
       );
     }
     final snapshot = <String, Object?>{
-      'schemaVersion': 4,
+      'schemaVersion': 5,
       'customers': recordsByCollection['customers'],
       'pipelineStages': stageRecords
           .map((stage) => stage['name'] as String)
@@ -253,8 +299,15 @@ class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
       'preferences': preferences.single,
       'delivery': {
         'projects': recordsByCollection['projects'],
+        'phases': recordsByCollection['phases'],
         'tasks': recordsByCollection['tasks'],
         'milestones': recordsByCollection['milestones'],
+        'materials': recordsByCollection['materials'],
+        'vendors': recordsByCollection['vendors'],
+        'requisitions': recordsByCollection['requisitions'],
+        'rfqs': recordsByCollection['rfqs'],
+        'vendorQuotes': recordsByCollection['vendorQuotes'],
+        'purchaseOrders': recordsByCollection['purchaseOrders'],
         'punchItems': recordsByCollection['punchItems'],
         'assets': recordsByCollection['assets'],
         'workLogs': recordsByCollection['workLogs'],
@@ -266,7 +319,9 @@ class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
         'templates': recordsByCollection['templates'],
         'proposals': recordsByCollection['proposals'],
         'invoices': recordsByCollection['invoices'],
-        'settings': financialSettings.single,
+        'settings': financialSettings.isEmpty
+            ? StudioFinancialSettings.defaults.toJson()
+            : financialSettings.single,
       },
       'communications': recordsByCollection['communications'],
     };
@@ -288,8 +343,16 @@ class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
     required int expectedRevision,
     WorkspaceCollectionPage? firstPage,
   }) async {
-    var page =
-        firstPage ?? await loadCollection(collection: collection, limit: 100);
+    WorkspaceCollectionPage page;
+    try {
+      page =
+          firstPage ?? await loadCollection(collection: collection, limit: 100);
+    } on WorkspaceApiException catch (error) {
+      if (error.statusCode == 403 && error.code == 'permission_denied') {
+        return [];
+      }
+      rethrow;
+    }
     if (!page.workspaceExists || page.revision != expectedRevision) {
       throw const WorkspaceApiException(409, 'workspace_revision_conflict');
     }
@@ -515,19 +578,32 @@ class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
     if (!StudioProjectAsset.allowedMimeTypes.contains(mimeType)) {
       throw const FormatException('The project file type is not allowed.');
     }
-    final userId = _currentUserId();
     final safeSegment = RegExp(r'^[A-Za-z0-9._-]{1,160}$');
     if (!safeSegment.hasMatch(projectId) || !safeSegment.hasMatch(assetId)) {
       throw const FormatException('The project file path is invalid.');
     }
-    final path = '$userId/$projectId/$assetId';
-    await Supabase.instance.client.storage
-        .from('project-files')
-        .uploadBinary(
-          path,
-          bytes,
-          fileOptions: FileOptions(contentType: mimeType, upsert: false),
-        );
+    final request = await _requestFileAction({
+      'action': 'create_upload',
+      'projectId': projectId,
+      'assetId': assetId,
+      'mimeType': mimeType,
+    });
+    final path = request['storagePath'];
+    final uploadUrl = request['uploadUrl'];
+    if (path != '$workspaceId/$projectId/$assetId' || uploadUrl is! String) {
+      throw const FormatException('The server returned an invalid upload URL.');
+    }
+    final response = await _client.put(
+      _validatedStorageUrl(uploadUrl),
+      headers: {'Content-Type': mimeType, 'x-upsert': 'false'},
+      body: bytes,
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw WorkspaceApiException(
+        response.statusCode,
+        'project_file_upload_failed',
+      );
+    }
     _uploadedPathsByAssetId[assetId] = path;
     _pendingUploads.add(path);
     return path;
@@ -535,12 +611,28 @@ class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
 
   Future<Uint8List> downloadProjectFile(StudioProjectAsset asset) async {
     final path = asset.storagePath;
-    if (path == null || !path.startsWith('${_currentUserId()}/')) {
+    if (path == null || !_isAssetPath(path, asset.projectId, asset.id)) {
       throw const FormatException('The project file path is invalid.');
     }
-    final bytes = await Supabase.instance.client.storage
-        .from('project-files')
-        .download(path);
+    final request = await _requestFileAction({
+      'action': 'create_download',
+      'projectId': asset.projectId,
+      'assetId': asset.id,
+    });
+    final downloadUrl = request['downloadUrl'];
+    if (downloadUrl is! String) {
+      throw const FormatException(
+        'The server returned an invalid download URL.',
+      );
+    }
+    final response = await _client.get(_validatedStorageUrl(downloadUrl));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw WorkspaceApiException(
+        response.statusCode,
+        'project_file_download_failed',
+      );
+    }
+    final bytes = response.bodyBytes;
     if (bytes.isEmpty ||
         bytes.length > StudioProjectAsset.maxFileBytes ||
         (asset.sizeBytes > 0 && bytes.length != asset.sizeBytes)) {
@@ -549,12 +641,53 @@ class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
     return bytes;
   }
 
-  String _currentUserId() {
-    final id = Supabase.instance.client.auth.currentUser?.id;
-    if (id == null || id.isEmpty) {
-      throw const WorkspaceApiException(401, 'unauthorized');
+  bool _isAssetPath(String path, String projectId, String assetId) {
+    final segments = path.split('/');
+    final safeSegment = RegExp(r'^[A-Za-z0-9._-]{1,160}$');
+    final uuid = RegExp(
+      r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+      caseSensitive: false,
+    );
+    return segments.length == 3 &&
+        segments[1] == projectId &&
+        segments[2] == assetId &&
+        (segments[0] == workspaceId || uuid.hasMatch(segments[0])) &&
+        segments.every(safeSegment.hasMatch);
+  }
+
+  Uri _validatedStorageUrl(String value) {
+    final uri = Uri.tryParse(value);
+    if (uri == null ||
+        uri.userInfo.isNotEmpty ||
+        !(uri.scheme == 'https' ||
+            uri.scheme == 'http' &&
+                const {'localhost', '127.0.0.1'}.contains(uri.host))) {
+      throw const FormatException(
+        'The server returned an invalid storage URL.',
+      );
     }
-    return id;
+    return uri;
+  }
+
+  Future<Map<String, dynamic>> _requestFileAction(
+    Map<String, Object?> body,
+  ) async {
+    final response = await _client.post(
+      baseUri.resolve('/api/project-files'),
+      headers: await _headers(),
+      body: jsonEncode(body),
+    );
+    return _decodeResponse(response);
+  }
+
+  Future<void> _deleteProjectFilePaths(Set<String> paths) async {
+    if (paths.isEmpty) return;
+    final response = await _client.delete(
+      baseUri.resolve('/api/project-files'),
+      headers: await _headers(),
+      body: jsonEncode({'paths': paths.toList()}),
+    );
+    _decodeResponse(response);
   }
 
   Future<Map<String, Object?>> _prepareStoredSnapshot(
@@ -566,7 +699,6 @@ class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
       snapshot['delivery']! as Map<String, dynamic>,
     );
     final assets = delivery['assets']! as List<dynamic>;
-    final userId = _currentUserId();
     final storedAssets = <Map<String, Object?>>[];
     for (final value in assets) {
       final asset = Map<String, dynamic>.from(value as Map<String, dynamic>);
@@ -593,8 +725,8 @@ class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
           uploadedThisSave.add(path);
         }
       }
-      if (!path.startsWith('$userId/') || path.contains('..')) {
-        throw const FormatException('A project file belongs to another owner.');
+      if (!_isAssetPath(path, projectId, id)) {
+        throw const FormatException('A project file path is invalid.');
       }
       asset
         ..remove('dataBase64')
@@ -640,9 +772,7 @@ class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
     final obsolete = previousPaths.difference(currentPaths);
     if (obsolete.isEmpty) return;
     try {
-      await Supabase.instance.client.storage
-          .from('project-files')
-          .remove(obsolete.toList());
+      await _deleteProjectFilePaths(obsolete);
     } on Exception catch (error) {
       debugPrint(
         'Removed project files from workspace records, but Storage cleanup failed: $error',
@@ -654,9 +784,7 @@ class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
     final cleanup = {...paths, ..._pendingUploads};
     if (cleanup.isEmpty) return;
     try {
-      await Supabase.instance.client.storage
-          .from('project-files')
-          .remove(cleanup.toList());
+      await _deleteProjectFilePaths(cleanup);
       for (final path in cleanup) {
         _pendingUploads.remove(path);
         _uploadedPathsByAssetId.removeWhere((_, value) => value == path);
@@ -709,8 +837,15 @@ class RemoteCustomerWorkspaceRepository implements CustomerWorkspaceRepository {
     }
     for (final field in [
       'projects',
+      'phases',
       'tasks',
       'milestones',
+      'materials',
+      'vendors',
+      'requisitions',
+      'rfqs',
+      'vendorQuotes',
+      'purchaseOrders',
       'punchItems',
       'assets',
       'workLogs',

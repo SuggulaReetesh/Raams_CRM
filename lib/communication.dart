@@ -14,6 +14,9 @@ class StudioCommunication {
     required this.createdByName,
     required this.createdAt,
     required this.updatedAt,
+    this.vendorId,
+    this.procurementRecordType,
+    this.procurementRecordId,
     this.mentionedPersonaIds = const [],
     this.readByPersonaIds = const [],
   });
@@ -54,6 +57,9 @@ class StudioCommunication {
   final String createdByName;
   final DateTime createdAt;
   final DateTime updatedAt;
+  final String? vendorId;
+  final String? procurementRecordType;
+  final String? procurementRecordId;
   final List<String> mentionedPersonaIds;
   final List<String> readByPersonaIds;
 
@@ -66,6 +72,9 @@ class StudioCommunication {
     id: id,
     clientId: clearClient ? null : clientId,
     clientName: clientName,
+    vendorId: vendorId,
+    procurementRecordType: procurementRecordType,
+    procurementRecordId: procurementRecordId,
     projectId: projectId,
     projectName: projectName,
     channel: channel,
@@ -85,6 +94,9 @@ class StudioCommunication {
     'id': id,
     'clientId': clientId,
     'clientName': clientName,
+    'vendorId': vendorId,
+    'procurementRecordType': procurementRecordType,
+    'procurementRecordId': procurementRecordId,
     'projectId': projectId,
     'projectName': projectName,
     'channel': channel,
@@ -149,6 +161,9 @@ class StudioCommunication {
       id: readString('id'),
       clientId: readNullableString('clientId'),
       clientName: readString('clientName'),
+      vendorId: readNullableString('vendorId'),
+      procurementRecordType: readNullableString('procurementRecordType'),
+      procurementRecordId: readNullableString('procurementRecordId'),
       projectId: readNullableString('projectId'),
       projectName: readString('projectName'),
       channel: readString('channel'),

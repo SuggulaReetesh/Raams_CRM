@@ -81,7 +81,12 @@ async function authenticateRequest(req, env = process.env) {
     typeof metadataName === 'string' && metadataName.trim().length > 0
       ? metadataName.trim().slice(0, 120)
       : email?.split('@')[0]?.slice(0, 120) || 'Studio owner';
-  return { userId: payload.sub, profile: { displayName, email } };
+  return {
+    userId: payload.sub,
+    email,
+    emailVerified: payload.email_verified === true,
+    profile: { displayName, email },
+  };
 }
 
 module.exports = {

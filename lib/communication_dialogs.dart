@@ -32,6 +32,7 @@ class CommunicationComposerDialog extends StatefulWidget {
     required this.initialChannel,
     this.initialClientId,
     this.initialProjectId,
+    this.initialRecipient,
   });
 
   final List<Customer> customers;
@@ -41,6 +42,7 @@ class CommunicationComposerDialog extends StatefulWidget {
   final String initialChannel;
   final String? initialClientId;
   final String? initialProjectId;
+  final String? initialRecipient;
 
   @override
   State<CommunicationComposerDialog> createState() =>
@@ -96,7 +98,9 @@ class _CommunicationComposerDialogState
     _subject = TextEditingController();
     _body = TextEditingController();
     _recipient = TextEditingController(
-      text: _channel == 'Email' ? _client?.email ?? '' : _client?.phone ?? '',
+      text: _channel == 'Email'
+          ? widget.initialRecipient ?? _client?.email ?? ''
+          : _client?.phone ?? '',
     );
   }
 
@@ -169,7 +173,8 @@ class _CommunicationComposerDialogState
                     _channel = channel;
                     _received = false;
                     if (channel == 'Email') {
-                      _recipient.text = _client?.email ?? '';
+                      _recipient.text =
+                          widget.initialRecipient ?? _client?.email ?? '';
                     } else if (channel == 'WhatsApp') {
                       _recipient.text = _client?.phone ?? '';
                     } else {

@@ -1,0 +1,9 @@
+{
+  "framework": null,
+  "outputDirectory": "build/web",
+  "routes": [
+    { "src": "/api/(.*)", "dest": "/api/$1" },
+    { "handle": "filesystem" },
+    { "src": "/(.*)", "dest": "/index.html" }
+  ]
+}

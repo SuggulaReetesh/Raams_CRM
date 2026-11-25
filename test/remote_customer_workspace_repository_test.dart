@@ -6,6 +6,8 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:raams_crm/backend/remote_customer_workspace_repository.dart';
 import 'package:raams_crm/customer.dart';
+import 'package:raams_crm/delivery.dart';
+import 'package:raams_crm/finance.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -67,8 +69,11 @@ void main() {
       'activities': maps(snapshot['activities']),
       'personas': maps(snapshot['personas']),
       'projects': maps(delivery['projects']),
+      'phases': maps(delivery['phases']),
       'tasks': maps(delivery['tasks']),
       'milestones': maps(delivery['milestones']),
+      'materials': maps(delivery['materials']),
+      'vendors': maps(delivery['vendors']),
       'punchItems': maps(delivery['punchItems']),
       'assets': maps(delivery['assets']),
       'workLogs': maps(delivery['workLogs']),
@@ -116,12 +121,23 @@ void main() {
             200,
           );
         }
-        expect(jsonDecode(request.body)['revision'], 7);
+        final requestBody = jsonDecode(request.body) as Map<String, dynamic>;
+        expect(requestBody['revision'], 7);
+        expect(
+          (requestBody['changes']
+              as Map<String, dynamic>)['delivery.materials'],
+          hasLength(1),
+        );
         expect(request.headers['authorization'], 'Bearer access-token');
+        expect(
+          request.headers['x-workspace-id'],
+          '00000000-0000-4000-8000-000000000001',
+        );
         return http.Response('{"revision":8}', 200);
       });
       final repository = RemoteCustomerWorkspaceRepository(
         baseUri: Uri.parse('https://api.example.test'),
+        workspaceId: '00000000-0000-4000-8000-000000000001',
         accessTokenProvider: () async => 'access-token',
         client: client,
       );
@@ -130,13 +146,22 @@ void main() {
         initialCustomers: const [],
         initialStages: const [],
       );
+      final material = StudioMaterial(
+        id: 'material-1',
+        name: 'Concrete',
+        category: 'Cement & concrete',
+        unit: 'm3',
+        specification: 'M25',
+        description: '',
+        isActive: true,
+      );
       await repository.saveWorkspace(
         customers: restored.customers,
         pipelineStages: restored.pipelineStages,
         activities: restored.activities,
         personas: restored.personas,
         preferences: restored.preferences,
-        delivery: restored.delivery,
+        delivery: restored.delivery.copyWith(materials: [material]),
         financials: restored.financials,
         communications: restored.communications,
       );
@@ -158,6 +183,7 @@ void main() {
       });
       final repository = RemoteCustomerWorkspaceRepository(
         baseUri: Uri.parse('https://api.example.test'),
+        workspaceId: '00000000-0000-4000-8000-000000000001',
         accessTokenProvider: () async => 'access-token',
         client: client,
       );
@@ -178,6 +204,66 @@ void main() {
           communications: workspace.communications,
         ),
         throwsA(isA<WorkspaceApiException>()),
+      );
+      repository.close();
+    },
+  );
+
+  test(
+    'remote repository loads and saves workspace line-item catalog rates',
+    () async {
+      final requests = <http.Request>[];
+      final client = MockClient((request) async {
+        requests.add(request);
+        if (request.method == 'GET') {
+          return http.Response(
+            jsonEncode({
+              'catalog': {
+                'lineItems': [
+                  {
+                    'id': 'starter-wardrobe',
+                    'name': 'Wardrobe',
+                    'basicRatePerSqft': 100,
+                    'mediumRatePerSqft': null,
+                    'luxuryRatePerSqft': 200,
+                    'active': true,
+                    'version': 2,
+                  },
+                ],
+              },
+            }),
+            200,
+          );
+        }
+        return http.Response('{"saved":true,"type":"lineItems"}', 200);
+      });
+      final repository = RemoteCustomerWorkspaceRepository(
+        baseUri: Uri.parse('https://api.example.test'),
+        workspaceId: '00000000-0000-4000-8000-000000000001',
+        accessTokenProvider: () async => 'access-token',
+        client: client,
+      );
+      const entry = StudioLineItemCatalogEntry(
+        id: 'starter-wardrobe',
+        name: 'Wardrobe',
+        basicRatePerSqft: 100,
+        mediumRatePerSqft: 150,
+        luxuryRatePerSqft: 200,
+        version: 3,
+      );
+
+      final catalog = await repository.loadLineItemCatalog();
+      expect(catalog.single.rateForQuality('Basic'), 100);
+      expect(catalog.single.rateForQuality('Medium'), isNull);
+      await repository.saveLineItemCatalogEntry(entry);
+
+      expect(requests.map((request) => request.method), ['GET', 'PUT']);
+      expect(requests.first.url.path, '/api/quotation-catalog');
+      final putBody = jsonDecode(requests.last.body) as Map<String, dynamic>;
+      expect(putBody['type'], 'lineItems');
+      expect(
+        (putBody['record'] as Map<String, dynamic>)['luxuryRatePerSqft'],
+        200,
       );
       repository.close();
     },
@@ -211,6 +297,7 @@ void main() {
       });
       final repository = RemoteCustomerWorkspaceRepository(
         baseUri: Uri.parse('https://api.example.test'),
+        workspaceId: '00000000-0000-4000-8000-000000000001',
         accessTokenProvider: () async => 'access-token',
         client: client,
       );
@@ -252,6 +339,7 @@ void main() {
     });
     final repository = RemoteCustomerWorkspaceRepository(
       baseUri: Uri.parse('https://api.example.test'),
+      workspaceId: '00000000-0000-4000-8000-000000000001',
       accessTokenProvider: () async => 'access-token',
       client: client,
     );

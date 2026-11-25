@@ -298,6 +298,53 @@ large-workspace performance verification remain outstanding.
 - Production monitoring and rollback procedures are operational.
 - Launch approval is recorded.
 
+### 11. WhatsApp inbound inbox, media, and CRM linking
+
+**Status:** `[ ]`
+**Depends on:** Milestones 3–5 and 7
+
+This milestone extends the existing WhatsApp Business Cloud API integration.
+Incoming messages first appear in a shared inbox. Staff can link them to a
+client and select a project; linked messages appear in the client's
+communication history and the selected project's activity.
+
+- [x] Record the initial scope: text, images, documents, and videos; omit
+  delivery/read statuses for now.
+- [x] Decide that unmatched sender numbers should create a customer record and
+  that staff manually link inbox messages to clients and projects.
+- [ ] Decide which customer fields are required for an automatically created
+  customer before enabling customer creation.
+- [ ] Extend webhook ingestion to parse supported text and media messages while
+  retaining signature verification, workspace routing, and duplicate-event
+  protection.
+- [ ] Retrieve media from Meta and store it in private Supabase Storage; save
+  the media metadata and message relationship in the CRM.
+- [ ] Enforce file type and size limits and workspace-scoped authorization for
+  media access, consistent with existing project-file protections.
+- [ ] Add a shared inbox UI that shows incoming messages and media, and lets
+  staff associate a message with a client and project.
+- [ ] Add linked messages to client communication history and project activity.
+  Messages linked after receipt should be added to the selected project's
+  activity when the link is made.
+- [ ] Define and test duplicate-customer behavior for sender phone numbers
+  before creating a new customer.
+- [ ] Test text and media ingestion, retries and duplicate webhooks, invalid
+  signatures, unsupported media, manual linking, and cross-workspace access.
+- [ ] Configure the Meta webhook and server environment in staging, then verify
+  the complete flow before production rollout.
+
+**Acceptance criteria**
+
+- Incoming supported messages appear once in the shared inbox, scoped to the
+  correct workspace.
+- Staff can link a message to a client and project; linked messages are visible
+  in both the client communication section and project activity.
+- Media is stored privately in Supabase and cannot be accessed across
+  workspaces.
+- Unmatched sender numbers create customers only after the required customer
+  fields and duplicate-handling behavior have been decided.
+- No WhatsApp delivery/read status workflow is included in this milestone.
+
 ## Release blockers
 
 - [ ] RLS and workspace-isolation tests pass.

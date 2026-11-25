@@ -62,17 +62,28 @@ Vercel API endpoints:
   returned to the client.
 - `POST /api/communications` sends email or WhatsApp messages from the
   connected workspace account and records provider delivery status.
+- `POST` and `DELETE /api/project-files` authorize project-file access through
+  the workspace and project roles, then issue short-lived Supabase Storage
+  upload/download URLs.
+- `GET` and `PUT /api/quotation-catalog` read or save workspace quotation
+  packages, rooms, components, services, materials, finishes, hardware,
+  and pricing rules.
+- `GET`, `POST`, and `PUT /api/quotation` manage server-calculated quotation
+  revisions, submission, approval, rejection, and totals.
+- `POST /api/quotation-pdf` renders and downloads the current revision as a
+  premium PDF document using PDFKit.
 - `GET` and `POST /api/webhooks/whatsapp` verify and process WhatsApp webhook
   events. Configure this URL in the Meta app.
 
-The workspace API validates Supabase JWTs using the project's JWKS endpoint.
-It uses the authenticated subject as the workspace owner and executes Neon
-queries in transactions under PostgreSQL row-level security. Never put
+The API validates Supabase JWTs using the project's JWKS endpoint. A signed-in
+user can belong to multiple organizations; every workspace operation requires
+an explicit `X-Workspace-Id` and active membership, and executes Neon queries
+under PostgreSQL row-level security. Never put
 `DATABASE_URL`, a Supabase service-role key, or any other privileged secret in
 Flutter build defines or source control. The Supabase publishable key is public
 and is not a substitute for authorization.
 Authenticated workspace reads/writes, integration settings, and communications
-sends use per-owner PostgreSQL rate limits and return `429` with `Retry-After`
+sends use per-user PostgreSQL rate limits and return `429` with `Retry-After`
 when exceeded. Configure edge-level limits separately for unauthenticated
 traffic and provider webhooks.
 
@@ -88,6 +99,12 @@ For local API work, put development-only values in the ignored `.env.local`:
 Supabase URL/key and API URL are supplied with `--dart-define`.
 Configure sender integrations only on the server:
 
+- `SUPABASE_SERVICE_ROLE_KEY`: server-only credential used to send organization
+  invitations through Supabase Auth and issue project-file Storage URLs. Never
+  expose this key in Flutter or the browser.
+- `SUPABASE_INVITE_REDIRECT_URL`: HTTPS web callback or the registered
+  `raamscrm://login-callback/` mobile callback. Add the exact URL to Supabase
+  Auth's allowed redirect URLs.
 - `INTEGRATION_ENCRYPTION_KEY`: canonical base64 for 32 random bytes; generate
   with `openssl rand -base64 32`. Keep a secure backup because losing this key
   makes saved sender credentials undecryptable.
